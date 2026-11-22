@@ -1,0 +1,34 @@
+JWT_SECRET=replace-with-a-long-random-secret
+NODE_ENV=development
+FIREBASE_PROJECT_ID=demo-sjs
+FIRESTORE_DATABASE_ID=(default)
+FIRESTORE_EMULATOR_HOST=127.0.0.1:43878
+# Leave FIRESTORE_SERVICE_ACCOUNT_JSON unset when using the Firestore Emulator.
+
+FRONTEND_URL=http://localhost:5173
+FRONTEND_URL_TRENDING=http://localhost:5173
+BASE_URL=http://localhost:43877
+CORS_ORIGIN=http://localhost:5173
+
+# Local chat development can use Ollama; deployed Workers should use a remote provider.
+AI_PROVIDER=ollama
+AI_MODEL=llama3.1:8b
+AI_ENDPOINT=http://127.0.0.1:11434/api/generate
+AI_BASE_URL=http://127.0.0.1:11434
+AI_API_KEY=
+AI_TIMEOUT_MS=60000
+EMBEDDING_PROVIDER=ollama
+EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_ENDPOINT=http://127.0.0.1:11434/api/embeddings
+
+# OpenAlex requests are cached in Firestore; never commit a real key here.
+OPENALEX_API_KEY=
+OPENALEX_CONFIG_ENCRYPTION_KEY=generate-a-random-secret-at-least-32-characters
+OPENALEX_CACHE_TTL_SECONDS=21600
+OPENALEX_TIMEOUT_MS=30000
+
+# Importer reads these from the shell only; it never loads the parent .env file.
+DATABASE_URL=
+NEO4J_URI=
+NEO4J_USERNAME=
+NEO4J_PASSWORD=

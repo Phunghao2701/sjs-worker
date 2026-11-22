@@ -1,0 +1,76 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "scientificjournalsystem-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-16",
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": [
+      "0 3 * * *"
+    ]
+  },
+  "vars": {
+    "FIREBASE_PROJECT_ID": "sjs-be",
+    "FIRESTORE_DATABASE_ID": "(default)",
+    "CORS_ORIGINS": "https://sjs-v2.vercel.app,https://global.hyperdatalab.org",
+    "HYPERDATALAB_SSO_BASE_URL": "https://rpr-grobid-gateway.hpl-storage.workers.dev",
+    "AI_PROVIDER": "ollama",
+    "AI_MODEL": "llama3.1:8b",
+    "CHAT_RATE_LIMIT_PER_MINUTE": "5"
+  },
+  "d1_databases": [
+    {
+      "binding": "RANKINGS_DB",
+      "database_name": "sjs-scimago-rankings",
+      "database_id": "0637f788-aed3-4f38-8313-99a15c67a9b3",
+      "migrations_dir": "migrations/d1",
+      "remote": true
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHAT_RATE_LIMITER",
+        "class_name": "ChatRateLimiter"
+      },
+      {
+        "name": "CHAT_RESULT_CACHE",
+        "class_name": "ChatResultCache"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ChatRateLimiter"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "ChatResultCache"
+      ]
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "ANALYTICS_QUEUE",
+        "queue": "sjs-analytics"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "sjs-analytics",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5,
+        "max_concurrency": 2,
+        "max_retries": 3,
+        "dead_letter_queue": "sjs-analytics-dlq"
+      }
+    ]
+  }
+}
