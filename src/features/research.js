@@ -997,117 +997,108 @@ async function journalAnalyticsData(ctx, articles, journals, mode) {
 async function sourceDevelopmentTrends(ctx) {
   const { query, db } = ctx;
   const currentYear = new Date().getFullYear();
-  const timeframeYears = Math.max(1, number(String(query.timeframe || '').match(/\d+/)?.[0], 5));
+  const timeframeYears = Math.min(20, Math.max(1, number(String(query.timeframe || '').match(/\d+/)?.[0], 5)));
   const fromYear = currentYear - timeframeYears + 1;
   const toYear = currentYear;
   const timeframe = Array.from({ length: timeframeYears }, (_, index) => fromYear + index);
-  const requestedArea = String(query.subject_area || query.domain || '').trim();
-  const requestedCategory = String(query.subject_category || '').trim();
-  const activeValue = value => value && !['all', 'all categories', 'all domains', 'all areas'].includes(String(value).trim().toLowerCase());
-  const [areas, categories, topics, metrics, rawArticles, zones, journals, issues, volumes] = await Promise.all([
-    all(db, 'subjectAreas'), all(db, 'subjectCategories'), all(db, 'topics'), all(db, 'analytics_topic_year'),
-    all(db, 'articles'), all(db, 'zones'), all(db, 'journals'), all(db, 'issues'), all(db, 'volumes'),
-  ]);
-  const topicById = new Map(topics.map(row => [String(row.topic_id || row.id), row]));
-  let project = null; let mappedDomain = 'all'; let categoryIds = [];
   const hasProject = Boolean(query.project_id && !['undefined', 'null'].includes(String(query.project_id)));
+  let scopes = [];
+  let articles = [];
   if (hasProject) {
-    project = ctx.internalJob ? await byId(db, 'projects', query.project_id) : await requireProject(ctx, query.project_id);
+    const project = ctx.internalJob ? await byId(db, 'projects', query.project_id) : await requireProject(ctx, query.project_id);
     if (!project) throw new HttpError(404, 'Project not found', 'PROJECT_NOT_FOUND');
-    const area = projectAreaFor(project, areas);
-    if (!area || isDeleted(area)) throw new HttpError(404, 'Project not found or has no associated subject area', 'NOT_FOUND');
-    mappedDomain = String(area.display_name || area.name || 'all');
-    categoryIds = categories.filter(row => !isDeleted(row) && String(row.subject_area_id) === String(area.subject_area_id || area.id))
-      .map(row => String(row.subject_category_id || row.id));
+    scopes = await loadProjectResearchScopes(db, [project]);
+    articles = await collaborationScopedArticles({
+      ...ctx,
+      query: { ...query, from_year: String(fromYear), to_year: String(toYear) },
+    });
+  } else {
+    const yearRange = `publication_year:${fromYear}-${toYear}`;
+    const [works] = await Promise.all([
+      openAlexRequest(ctx, 'works', {
+        filter: yearRange,
+        per_page: 200,
+        select: 'id,display_name,publication_year,cited_by_count,primary_topic,topics,authorships,referenced_works',
+      }),
+    ]);
+    articles = (works.results || []).map(openAlexWorkToLegacy);
   }
-  if (activeValue(requestedCategory)) {
-    const selected = categories.find(row => !isDeleted(row) && (String(row.subject_category_id || row.id) === requestedCategory || String(row.display_name || row.name || '').toLowerCase() === requestedCategory.toLowerCase()));
-    categoryIds = selected ? [String(selected.subject_category_id || selected.id)] : [];
-    if (selected) {
-      const area = areas.find(row => String(row.subject_area_id || row.id) === String(selected.subject_area_id));
-      mappedDomain = String(area?.display_name || area?.name || mappedDomain);
-    }
-  } else if (activeValue(requestedArea)) {
-    const selected = areas.find(row => !isDeleted(row) && (String(row.subject_area_id || row.id) === requestedArea || String(row.display_name || row.name || '').toLowerCase() === requestedArea.toLowerCase()));
-    if (selected) {
-      mappedDomain = String(selected.display_name || selected.name || 'all');
-      categoryIds = categories.filter(row => !isDeleted(row) && String(row.subject_area_id) === String(selected.subject_area_id || selected.id))
-        .map(row => String(row.subject_category_id || row.id));
-    } else if (!hasProject) { mappedDomain = 'all'; categoryIds = []; }
-  }
-  const selectedCategoryIds = new Set(categoryIds);
-  const mappedArea = mappedDomain === 'all' ? null : areas.find(row => String(row.display_name || row.name || '').toLowerCase() === mappedDomain.toLowerCase());
-  const fallbackCategoryIds = !selectedCategoryIds.size && mappedArea
-    ? new Set(categories.filter(row => !isDeleted(row) && String(row.subject_area_id) === String(mappedArea.subject_area_id || mappedArea.id)).map(row => String(row.subject_category_id || row.id)))
-    : null;
-  const scopeCategoryIds = selectedCategoryIds.size ? selectedCategoryIds : fallbackCategoryIds;
-  const selectedTopicIds = new Set(topics.filter(row => !scopeCategoryIds || scopeCategoryIds.has(String(row.subject_category_id)))
-    .map(row => String(row.topic_id || row.id)));
-  const inScopeTopic = topicId => selectedTopicIds.has(String(topicId || ''));
 
-  let zone = String(query.zone || query.region || '').trim();
-  let targetZone = null;
-  if (zone && !['all', 'global', 'global distribution'].includes(zone.toLowerCase())) {
-    targetZone = zones.find(row => String(row.name || '').toLowerCase() === zone.toLowerCase() || String(row.code || '').toLowerCase() === zone.toLowerCase()) || null;
+  const yearFilter = `publication_year:${fromYear}-${toYear}`;
+  const trendResults = hasProject
+    ? await openAlexPublicationTrends(ctx, scopes, { fromYear, toYear })
+    : (await openAlexRequest(ctx, 'works', { filter: yearFilter, group_by: 'publication_year', per_page: 200 })).group_by
+      .map(row => ({ year: Number(row.key), totalPublications: Number(row.count || 0) }));
+  const yearly = new Map(timeframe.map(year => [year, { year, value: 0 }]));
+  for (const row of trendResults) {
+    const point = yearly.get(Number(row.year));
+    if (point) point.value = Number(row.totalPublications || 0);
   }
-  const journalById = new Map(journals.map(row => [String(row.journal_id || row.id), row]));
-  const issueById = new Map(issues.map(row => [String(row.issue_id || row.id), row]));
-  const volumeById = new Map(volumes.map(row => [String(row.volume_id || row.id), row]));
-  const inYearRange = row => Number(row.year) >= fromYear && Number(row.year) <= toYear && inScopeTopic(row.topic_id);
-  let trendMetrics = metrics.filter(inYearRange);
-  if (targetZone) {
-    const allowedArticleIds = new Set(rawArticles.filter(article => {
-      const issue = issueById.get(String(article.issue_id)); const volume = volumeById.get(String(issue?.volume_id));
-      const journal = journalById.get(String(volume?.journal_id));
-      return journal && [journal.region, journal.country].some(value => String(value) === String(targetZone.zone_id || targetZone.id))
-        && yearOf(article) >= fromYear && yearOf(article) <= toYear && inScopeTopic(article.primary_topic);
-    }).map(row => String(row.article_id || row.id)));
-    const counts = new Map();
-    for (const article of rawArticles) {
-      const id = String(article.article_id || article.id); const topicId = String(article.primary_topic || ''); const year = yearOf(article);
-      if (!allowedArticleIds.has(id) || !inScopeTopic(topicId)) continue;
-      const row = counts.get(`${topicId}:${year}`) || { topic_id: topicId, year, article_count: 0, citation_count: 0 };
-      row.article_count++; row.citation_count += number(article.citation_count); counts.set(`${topicId}:${year}`, row);
-    }
-    trendMetrics = [...counts.values()];
-  }
-  const yearly = new Map(timeframe.map(year => [year, { year, value: 0, citations: 0 }]));
-  for (const row of trendMetrics) {
-    const y = yearly.get(Number(row.year)); if (!y) continue;
-    y.value += number(row.article_count); y.citations += number(row.citation_count);
-  }
-  const publicationData = [...yearly.values()].map(({ year, value }) => ({ year, value }));
+  const publicationData = [...yearly.values()];
   const previous = publicationData.at(-2)?.value || 0; const current = publicationData.at(-1)?.value || 0;
   const growthRate = previous ? Math.round((current - previous) / previous * 1000) / 10 : 0;
-  const citationMirroring = { data: [...yearly.values()].map(row => ({ year: row.year, self: Math.floor(row.citations * 0.15), external: row.citations - Math.floor(row.citations * 0.15) })) };
+  // OpenAlex does not expose a project-level self-citation split. Leave this
+  // unavailable instead of rendering the former invented 15%/85% breakdown.
+  const citationMirroring = {
+    available: false,
+    reason: 'OpenAlex does not provide a project-level self-citation breakdown.',
+    data: [],
+  };
 
-  const topicTotals = new Map();
-  for (const row of trendMetrics) {
-    const topic = topicById.get(String(row.topic_id)); if (!topic?.display_name) continue;
-    const entry = topicTotals.get(String(row.topic_id)) || { name: topic.display_name, total: 0, years: new Map() };
-    entry.total += number(row.article_count); entry.years.set(Number(row.year), (entry.years.get(Number(row.year)) || 0) + number(row.article_count)); topicTotals.set(String(row.topic_id), entry);
-  }
-  const topicEvolution = { topics: [...topicTotals.values()].sort((a, b) => b.total - a.total).slice(0, 3).map((topic, index) => ({
-    name: topic.name, domain: ['Expanding', 'Stable', 'Emerging'][index % 3], percentage: 0,
-    data: timeframe.map(year => ({ year, value: topic.years.get(year) || 0 })),
-  })) };
-
-  const articles = rawArticles.filter(article => !isDeleted(article) && inScopeTopic(article.primary_topic));
-  const frontierRows = new Map();
+  const topicRows = new Map();
   for (const article of articles) {
-    const id = String(article.primary_topic || ''); const topic = topicById.get(id); if (!topic?.display_name) continue;
-    const row = frontierRows.get(id) || { topic: topic.display_name, articles: 0, citations: 0 };
-    row.articles++; row.citations += number(article.citation_count); frontierRows.set(id, row);
+    const topic = article.primary_topic || article.topic_id;
+    const name = String(article.topic_name || article.primary_topic_name || '').trim();
+    const year = yearOf(article);
+    if (!topic || !name || year == null || year < fromYear || year > toYear) continue;
+    const key = String(topic);
+    const row = topicRows.get(key) || {
+      name,
+      domain: article.primary_topic_domain || 'OpenAlex topic',
+      total: 0,
+      years: new Map(),
+      citationsByYear: new Map(),
+    };
+    row.total += 1;
+    row.years.set(year, (row.years.get(year) || 0) + 1);
+    row.citationsByYear.set(year, (row.citationsByYear.get(year) || 0) + number(article.citation_count));
+    topicRows.set(key, row);
   }
-  const frontier = [...frontierRows.values()].sort((a, b) => b.citations / b.articles - a.citations / a.articles).slice(0, 10);
-  const maxImpact = Math.max(1, ...frontier.map(row => row.citations / row.articles));
-  const velocities = frontier.map(row => row.citations).filter(value => value > 0).sort((a, b) => a - b);
-  const frontierDetection = { items: frontier.map(row => {
-    const impactVelocity = Math.round((row.citations / row.articles) * 10 / maxImpact * 10) / 10;
-    const rank = row.citations > 0 && velocities.length > 1 ? velocities.indexOf(row.citations) / (velocities.length - 1) : row.citations > 0 ? 1 : 0;
-    const citationVelocity = Math.round((row.citations > 0 ? 3 + rank * 6.5 : 0) * 10) / 10;
-    return { label: row.topic, impactVelocity, citationVelocity, status: impactVelocity >= 3 && citationVelocity >= 5 ? 'frontier' : 'emerging' };
-  }) };
+  const orderedTopics = [...topicRows.values()].sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  const topicEvolution = {
+    topics: orderedTopics.slice(0, 3).map(topic => ({
+      name: topic.name,
+      domain: topic.domain,
+      percentage: articles.length ? Math.round((topic.total / articles.length) * 1000) / 10 : 0,
+      data: timeframe.map(year => ({ year, value: topic.years.get(year) || 0 })),
+    })),
+  };
+
+  const frontierRows = orderedTopics.map(topic => {
+    const recentYear = timeframe.at(-1);
+    const priorYear = timeframe.at(-2);
+    const recentCount = topic.years.get(recentYear) || 0;
+    const priorCount = topic.years.get(priorYear) || 0;
+    const recentCitations = topic.citationsByYear.get(recentYear) || 0;
+    const avgCitations = topic.total ? [...topic.citationsByYear.values()].reduce((sum, value) => sum + value, 0) / topic.total : 0;
+    return { ...topic, recentCount, priorCount, recentCitations, avgCitations };
+  }).slice(0, 10);
+  const maxGrowth = Math.max(1, ...frontierRows.map(row => row.priorCount ? Math.max(0, ((row.recentCount - row.priorCount) / row.priorCount) * 100) : 0));
+  const maxImpact = Math.max(1, ...frontierRows.map(row => row.avgCitations));
+  const frontierDetection = {
+    items: frontierRows.map(row => {
+      const growth = row.priorCount ? Math.max(0, ((row.recentCount - row.priorCount) / row.priorCount) * 100) : 0;
+      const citationVelocity = Math.round((growth / maxGrowth) * 100) / 10;
+      const impactVelocity = Math.round((row.avgCitations / maxImpact) * 100) / 10;
+      return {
+        label: row.name,
+        impactVelocity,
+        citationVelocity,
+        size: row.total,
+        status: impactVelocity >= 5 && citationVelocity >= 5 ? 'frontier' : 'emerging',
+      };
+    }),
+  };
 
   let forecastInsightsData;
   if (hasProject) {
@@ -1123,14 +1114,7 @@ async function sourceDevelopmentTrends(ctx) {
               : `Insufficient data to detect forecast signals for ${subject}.`;
       return { id: type, type: title, accent: type === 'peak' ? 'growth' : type === 'saturation' ? 'warning' : 'innovation', title, description };
     });
-  } else {
-    const domain = mappedDomain === 'all' ? 'Biochemistry' : mappedDomain;
-    forecastInsightsData = [
-      { id: 'peak', type: 'Predictive Peak', accent: 'growth', title: 'Predictive Peak', description: `${domain} is projected to reach its citation apex in Q3 2027 based on current velocity.` },
-      { id: 'saturation', type: 'Saturation Alert', accent: 'warning', title: 'Saturation Alert', description: 'Citation velocity for basic molecular modeling shows signs of plateauing in early 2026.' },
-      { id: 'synergy', type: 'Cross-Domain Synergy', accent: 'innovation', title: 'Cross-Domain Synergy', description: `High probability of breakthrough convergence between ${domain} and Neural Networks.` },
-    ];
-  }
+  } else forecastInsightsData = [];
   return { publicationTrend: { growthRate, unit: 'YoY', data: publicationData }, citationMirroring, topicEvolution, frontierDetection, forecastInsights: forecastInsightsData };
 }
 
@@ -1156,29 +1140,7 @@ async function analytics(ctx) {
   }
   if (endpoint === 'distribution') return response(await distributionData(ctx), 'Fetch distribution successfully');
   if (endpoint === 'development-trends' && ctx.query.project_id) {
-    const project = await requireProject(ctx, ctx.query.project_id);
-    const [scope] = await loadProjectResearchScopes(ctx.db, [project]);
-    const year = new Date().getFullYear();
-    const years = Math.max(1, number(String(ctx.query.timeframe || '').match(/\d+/)?.[0], 5));
-    const fromYear = year - years + 1;
-    const trends = await openAlexPublicationTrends(ctx, scope ? [scope] : [], { fromYear, toYear: year });
-    const trendByYear = new Map(trends.map(row => [Number(row.year), Number(row.totalPublications || 0)]));
-    const data = Array.from({ length: years }, (_, index) => {
-      const currentYear = fromYear + index;
-      return { year: currentYear, value: trendByYear.get(currentYear) || 0 };
-    });
-    const completed = data.filter(row => row.year < year);
-    const previous = completed.at(-2)?.value || 0;
-    const current = completed.at(-1)?.value || 0;
-    const growthRate = previous ? Math.round((current - previous) / previous * 1000) / 10 : 0;
-    const citationMirroring = { data: data.map(row => ({ year: row.year, self: 0, external: 0 })) };
-    return response({
-      publicationTrend: { growthRate, unit: 'YoY', data },
-      citationMirroring,
-      topicEvolution: { topics: [] },
-      frontierDetection: { items: [] },
-      forecastInsights: [],
-    }, 'Fetch development trends successfully');
+    return response(await sourceDevelopmentTrends(ctx), 'Fetch development trends successfully');
   }
   if (endpoint === 'top-entities' && ctx.query.project_id) {
     const works = await collaborationScopedArticles(ctx, { summary: true });
