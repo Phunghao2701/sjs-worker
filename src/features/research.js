@@ -1154,9 +1154,57 @@ async function sourceDevelopmentTrends(ctx) {
     }),
   };
 
-  // Forecast cards are intentionally empty until they can be derived from live
-  // OpenAlex data; legacy stored insights are not scholarly source-of-truth.
+  // Derive forecast insights from the same live OpenAlex results used by the
+  // project analytics. These are heuristic signals, not stored predictions.
+  const completedPublication = publicationData.filter(row => row.year < currentYear && row.value > 0);
   const forecastInsightsData = [];
+  if (completedPublication.length) {
+    const latest = completedPublication.at(-1);
+    const previous = publicationData.find(row => row.year === latest.year - 1);
+    const topic = orderedTopics[0];
+    const publicationGrowth = previous?.value > 0
+      ? Math.round(((latest.value - previous.value) / previous.value) * 1000) / 10
+      : null;
+    forecastInsightsData.push({
+      id: 'peak', type: 'peak', title: 'Predictive Peak',
+      description: topic
+        ? `${topic.name} is the most represented topic in the project’s OpenAlex results (${topic.total.toLocaleString()} works). ${previous?.value > 0 ? `Overall publications ${publicationGrowth >= 0 ? 'grew' : 'declined'} ${Math.abs(publicationGrowth)}% from ${previous.year} to ${latest.year}.` : `The latest complete year is ${latest.year} with ${latest.value.toLocaleString()} publications.`}`
+        : `OpenAlex recorded ${latest.value.toLocaleString()} project publications in ${latest.year}${previous?.value > 0 ? `, ${publicationGrowth >= 0 ? 'up' : 'down'} ${Math.abs(publicationGrowth)}% from ${previous.year}` : ''}.`,
+    });
+
+    if (topic) {
+      const history = timeframe
+        .filter(year => year < currentYear)
+        .map(year => [year, topic.years.get(year) || 0]);
+      const latestTopic = history.at(-1);
+      const priorTopic = history.at(-2);
+      const beforePriorTopic = history.at(-3);
+      const latestGrowth = latestTopic && priorTopic && priorTopic[1] > 0 ? ((latestTopic[1] - priorTopic[1]) / priorTopic[1]) * 100 : null;
+      const priorGrowth = priorTopic && beforePriorTopic && beforePriorTopic[1] > 0 ? ((priorTopic[1] - beforePriorTopic[1]) / beforePriorTopic[1]) * 100 : null;
+      const slowing = latestGrowth !== null && priorGrowth !== null && latestGrowth < priorGrowth;
+      forecastInsightsData.push({
+        id: 'saturation', type: 'saturation', title: 'Saturation Alert',
+        description: latestGrowth === null
+          ? `OpenAlex has ${topic.total.toLocaleString()} works for ${topic.name}, but there are not yet two complete years to assess whether growth is slowing.`
+          : `${topic.name} had ${latestTopic[1].toLocaleString()} works in ${latestTopic[0]} (${latestGrowth >= 0 ? '+' : ''}${Math.round(latestGrowth)}% year over year). ${slowing ? 'Its growth rate is below the previous year, a signal to monitor for possible saturation.' : 'The available year-over-year data does not show slowing growth.'}`,
+      });
+    }
+
+    const domainCounts = new Map();
+    for (const article of articles) {
+      const domain = String(article.primary_topic_domain || '').trim();
+      if (domain) domainCounts.set(domain, (domainCounts.get(domain) || 0) + 1);
+    }
+    const leadingDomains = [...domainCounts].sort((a, b) => b[1] - a[1]).slice(0, 2);
+    if (leadingDomains.length) {
+      forecastInsightsData.push({
+        id: 'synergy', type: 'synergy', title: 'Cross-Domain Synergy',
+        description: leadingDomains.length > 1
+          ? `The OpenAlex sample spans ${domainCounts.size} research domains. The strongest represented domains are ${leadingDomains.map(([name]) => name).join(' and ')}, indicating cross-domain activity in this project.`
+          : `The current OpenAlex sample is concentrated in ${leadingDomains[0][0]}; there is not enough domain diversity to identify a cross-domain signal yet.`,
+      });
+    }
+  }
   return { publicationTrend: { growthRate, unit: 'YoY', data: publicationData }, citationMirroring, topicEvolution, frontierDetection, forecastInsights: forecastInsightsData };
 }
 
@@ -1974,12 +2022,32 @@ async function countriesByArticle(ctx, articles) {
     affiliations.get(key).add(String(link.institution_id));
   }
   const countries = new Map();
-  for (const [articleId, authorIds] of authorIdsByArticle) {
-    const article = articleById.get(articleId); const year = yearOf(article); const countryNames = new Set();
-    for (const authorId of authorIds) for (const institutionId of affiliations.get(`${year}:${authorId}`) || []) {
-      const institution = institutionById.get(institutionId); const code = String(institution?.country_code || '').toUpperCase();
-      const country = countryByCode.get(code); if (country?.name) countryNames.add(String(country.name).toUpperCase());
+  for (const article of articles) {
+    const articleId = String(article.article_id || article.id);
+    const year = yearOf(article);
+    const countryNames = new Set();
+
+    // OpenAlex-scoped works already contain authorship affiliations and country codes.
+    // Use these first so project analytics do not depend on legacy author/institution join tables.
+    for (const author of article.authors || []) {
+      for (const institution of author.institutions || []) {
+        const code = String(institution.country_code || '').toUpperCase();
+        if (!/^[A-Z]{2}$/.test(code)) continue;
+        const country = countryByCode.get(code);
+        countryNames.add(String(country?.name || code).toUpperCase());
+      }
     }
+
+    // Preserve compatibility with locally normalized legacy records.
+    for (const authorId of authorIdsByArticle.get(articleId) || []) {
+      for (const institutionId of affiliations.get(`${year}:${authorId}`) || []) {
+        const institution = institutionById.get(institutionId);
+        const code = String(institution?.country_code || '').toUpperCase();
+        const country = countryByCode.get(code);
+        if (country?.name) countryNames.add(String(country.name).toUpperCase());
+      }
+    }
+
     if (countryNames.size) countries.set(articleId, countryNames);
   }
   return countries;
