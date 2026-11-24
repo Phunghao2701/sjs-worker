@@ -1651,6 +1651,11 @@ async function authorArticles(ctx) {
   return { success: true, code: 'AUTHOR_ARTICLES_FETCHED', message: 'LÃ¡ÂºÂ¥y bÃƒÂ i viÃ¡ÂºÂ¿t cÃ¡Â»Â§a tÃƒÂ¡c giÃ¡ÂºÂ£ thÃƒÂ nh cÃƒÂ´ng', pagination: { page, limit, total: rows.length, total_pages: Math.max(1, Math.ceil(rows.length / limit)) }, data: rows.slice(start, start + limit) };
 }
 
+const ORGANIZATION_LIKE_AUTHOR_NAME = /\b(universit(?:y|ies)|college|institute|institution|museum|laborator(?:y|ies)|lab|research center|research centre|biodiversity center|biodiversity centre|botanic garden|botanical garden|academy|hospital|society|foundation|observatory|department|ministry|organization|organisation|association|library|herbarium|bureau|commission|corporation|consortium|council|agency)\b/i;
+
+function isOrganizationLikeAuthor(name, orcid) {
+  return !orcid && ORGANIZATION_LIKE_AUTHOR_NAME.test(String(name || '').trim());
+}
 async function authorLeaderboard(ctx) {
   {
   const period = String(ctx.query.period || 'all').trim().toLowerCase();
@@ -1673,24 +1678,25 @@ async function authorLeaderboard(ctx) {
     });
     metadataById = new Map((metadata.results || []).map(author => [String(author.id).replace(/^.*\//, '').toUpperCase(), author]));
   }
-  const rows = groups.map((group, index) => {
+  const rows = groups.map(group => {
     const openAlexId = String(group.key).replace(/^.*\//, '').toUpperCase();
     const author = metadataById.get(openAlexId) || {};
+    const displayName = author.display_name || group.key_display_name || 'Unknown author';
+    if (isOrganizationLikeAuthor(displayName, author.orcid)) return null;
     const topics = Array.isArray(author.topics) ? [...author.topics] : [];
     const subjectAreas = [...new Set(topics
       .map(topic => topic.field?.display_name || topic.subfield?.display_name || topic.display_name)
       .filter(Boolean))];
     return {
       author_id: Number(openAlexId.slice(1)), openalex_id: openAlexId,
-      orcid: author.orcid || null, display_name: author.display_name || group.key_display_name || 'Unknown author',
+      orcid: author.orcid || null, display_name: displayName,
       last_known_institution: author.last_known_institutions?.[0]?.display_name || null,
       article_count: Number(group.count || 0), works_count: Number(group.count || 0),
       cited_by_count: Number(author.cited_by_count || 0),
       h_index: Number(author.summary_stats?.h_index || 0), i10_index: Number(author.summary_stats?.i10_index || 0),
-      final_rank: index + 1,
       subject_area: subjectAreas[0] || null, primary_subject_area: subjectAreas[0] || null, subject_areas: subjectAreas,
     };
-  });
+  }).filter(Boolean).map((author, index) => ({ ...author, final_rank: index + 1 }));
   const openAlexPage = paginate(rows, ctx.query, 10, 100);
   openAlexPage.totalPages = Math.max(1, openAlexPage.totalPages);
   return { success: true, code: 'AUTHOR_LEADERBOARD_FETCHED', message: 'Author leaderboard fetched from OpenAlex', pagination: { page: openAlexPage.page, limit: openAlexPage.limit, total: openAlexPage.total, total_pages: openAlexPage.totalPages }, data: openAlexPage.items };
