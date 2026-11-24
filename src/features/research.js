@@ -2,7 +2,7 @@ import { HttpError } from '../core/http.js';
 import { defineRoutes, ok } from '../core/router.js';
 import { all, byId, find, hydrateArticles, id, isDeleted, matchText, nowIso, paginate, requireFound } from '../firestore/repository.js';
 import { requireProject } from './projects.js';
-import { getOpenAlexSourcesByIds, getOpenAlexWorksByIds, openAlexWorkToLegacy, searchOpenAlexEntities, searchOpenAlexWorkGraph } from '../openalex/adapters.js';
+import { getOpenAlexAuthorsByIds, getOpenAlexSourcesByIds, getOpenAlexWorksByIds, openAlexWorkToLegacy, searchOpenAlexEntities, searchOpenAlexWorkGraph } from '../openalex/adapters.js';
 import { openAlexRequest } from '../openalex/client.js';
 import { loadProjectResearchScopes, openAlexPublicationTrends, openAlexTrendingKeywords } from '../openalex/project-dashboard.js';
 import { normalizeOpenAlexKeywordId } from '../openalex/project-sync.js';
@@ -2395,6 +2395,21 @@ async function sourceProductivityMatrix(ctx, scopedArticles = null) {
     }
     byAuthor.set(authorId, years);
   }
+  let openAlexAuthors = [];
+  try {
+    const authorIds = [
+      ...articles.flatMap(article => (article.authors || []).map(author => author.openalex_id || author.author_id || author.id)),
+      ...[...byAuthor.keys()].map(authorId => authorById.get(authorId)?.openalex_id || authorId),
+    ];
+    openAlexAuthors = await getOpenAlexAuthorsByIds(ctx, authorIds);
+  } catch (error) {
+    console.warn('[analytics] OpenAlex author metrics unavailable for productivity matrix:', error?.message || error);
+  }
+  const hIndexByAuthorId = new Map(openAlexAuthors.map(author => {
+    const openAlexId = String(author.id || '').split('/').pop().toUpperCase();
+    const numericId = openAlexId.match(/^A(\d+)$/)?.[1];
+    return [numericId || openAlexId, number(author.summary_stats?.h_index)];
+  }));
   const points = [];
   for (const [authorId, years] of byAuthor) {
     const author = authorById.get(authorId);
@@ -2407,7 +2422,7 @@ async function sourceProductivityMatrix(ctx, scopedArticles = null) {
       const orderedYears = [...years.keys()].sort((a, b) => a == null ? -1 : b == null ? 1 : b - a);
       yearlyOutput = years.get(orderedYears[0])?.size || 0;
     }
-    const hIndex = number(author.h_index);
+    const hIndex = hIndexByAuthorId.get(authorId) ?? number(author.h_index);
     if (yearlyOutput > 0 && hIndex >= 0) points.push({ authorId: String(author.author_id || author.id), authorName: author.display_name || null, yearlyOutput, hIndex });
   }
   return points.sort((a, b) => b.hIndex - a.hIndex || b.yearlyOutput - a.yearlyOutput).slice(0, limit);
@@ -2484,12 +2499,16 @@ async function sourceJournalMigration(ctx) {
   if (hasProject) {
     const projectArticles = await sourceJournalArticles(ctx, 'ranking');
     const sources = await getOpenAlexSourcesByIds(ctx, projectArticles.map(article => article.journal_source_id || article.journal_openalex_id));
-    const sourceById = new Map(sources.map(row => [String(row.id || '').split('/').pop(), row]));
+    const normalizeSourceId = value => {
+      const id = String(value || '').trim().replace(/\/+$/, '').split('/').pop().toUpperCase();
+      return /^\d+$/.test(id) ? `S${id}` : id;
+    };
+    const sourceById = new Map(sources.map(row => [normalizeSourceId(row.id), row]));
     const accessByJournal = new Map();
     for (const article of projectArticles) {
-      const id = String(article.journal_source_id || article.journal_id || '');
+      const id = normalizeSourceId(article.journal_source_id || article.journal_openalex_id || article.journal_id);
       if (!id) continue;
-      const source = sourceById.get(id.split('/').pop());
+      const source = sourceById.get(id);
       const access = source?.is_oa;
       if (typeof access === 'boolean') accessByJournal.set(id, access);
     }

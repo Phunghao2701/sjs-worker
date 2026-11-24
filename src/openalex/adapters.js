@@ -130,6 +130,21 @@ export async function getOpenAlexSourcesByIds(ctx, values) {
   return sources;
 }
 
+export async function getOpenAlexAuthorsByIds(ctx, values) {
+  const ids = [...new Set((values || []).map(value => String(value || '').trim().replace(/^https?:\/\/openalex\.org\//i, '').replace(/\/+$/, '').split('/').pop().toUpperCase()).filter(value => /^A\d+$/.test(value)))];
+  const authors = [];
+  for (let offset = 0; offset < ids.length; offset += 50) {
+    const batch = ids.slice(offset, offset + 50);
+    const result = await openAlexRequest(ctx, 'authors', {
+      filter: `ids.openalex:${batch.join('|')}`,
+      per_page: batch.length,
+      select: 'id,display_name,summary_stats,works_count,cited_by_count',
+    });
+    authors.push(...(result.results || []));
+  }
+  return authors;
+}
+
 function toLegacyEntity(kind, item) {
   const id = numericSuffix(item.id) ?? openAlexId(item.id);
   const common = { openalex_id: openAlexId(item.id), openalex_url: item.id || null, updated_date: item.updated_date || null, is_deleted: false };
