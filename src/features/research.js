@@ -1074,14 +1074,14 @@ async function sourceDevelopmentTrends(ctx) {
     })),
   };
 
+  const completedYears = timeframe.filter(year => year < currentYear);
+  const recentYear = completedYears.at(-1);
+  const priorYear = completedYears.at(-2);
   const frontierRows = orderedTopics.map(topic => {
-    const recentYear = timeframe.at(-1);
-    const priorYear = timeframe.at(-2);
     const recentCount = topic.years.get(recentYear) || 0;
     const priorCount = topic.years.get(priorYear) || 0;
-    const recentCitations = topic.citationsByYear.get(recentYear) || 0;
     const avgCitations = topic.total ? [...topic.citationsByYear.values()].reduce((sum, value) => sum + value, 0) / topic.total : 0;
-    return { ...topic, recentCount, priorCount, recentCitations, avgCitations };
+    return { ...topic, recentCount, priorCount, avgCitations };
   }).slice(0, 10);
   const maxGrowth = Math.max(1, ...frontierRows.map(row => row.priorCount ? Math.max(0, ((row.recentCount - row.priorCount) / row.priorCount) * 100) : 0));
   const maxImpact = Math.max(1, ...frontierRows.map(row => row.avgCitations));
@@ -1100,21 +1100,9 @@ async function sourceDevelopmentTrends(ctx) {
     }),
   };
 
-  let forecastInsightsData;
-  if (hasProject) {
-    const raw = await forecastInsights(db, query.project_id);
-    forecastInsightsData = raw.map(item => {
-      const params = item.parameters || {}; const subject = params.subject || mappedDomain || 'research';
-      const type = item.type === 'PEAK' ? 'peak' : item.type === 'ALERT' ? 'saturation' : 'synergy';
-      const title = type === 'peak' ? 'Predictive Peak' : type === 'saturation' ? 'Saturation Alert' : 'Cross-Domain Synergy';
-      const description = item.insight_key === 'forecast.peak.insight' ? `${subject} is projected to reach its citation apex in Q3 2027 based on current velocity.`
-        : item.insight_key === 'forecast.alert.insight' ? `${subject} shows signs of topic saturation; expect a pivot towards newer methodologies.`
-          : item.insight_key === 'forecast.synergy.insight' ? `New cluster forming at the intersection of ${params.keyword || 'related fields'} and ${params.relatedSubject || 'Neural Engineering'} in ${subject}.`
-            : item.insight_key === 'forecast.synergy.keyword_only' ? `Keyword activity detected for ${params.keyword || 'related fields'} in ${subject}.`
-              : `Insufficient data to detect forecast signals for ${subject}.`;
-      return { id: type, type: title, accent: type === 'peak' ? 'growth' : type === 'saturation' ? 'warning' : 'innovation', title, description };
-    });
-  } else forecastInsightsData = [];
+  // Forecast cards are intentionally empty until they can be derived from live
+  // OpenAlex data; legacy stored insights are not scholarly source-of-truth.
+  const forecastInsightsData = [];
   return { publicationTrend: { growthRate, unit: 'YoY', data: publicationData }, citationMirroring, topicEvolution, frontierDetection, forecastInsights: forecastInsightsData };
 }
 
