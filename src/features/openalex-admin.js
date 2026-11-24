@@ -35,14 +35,13 @@ export const openAlexAdminRoutes = defineRoutes([
         return { success: true, data: openAlexKeyStatus(ctx, keyState, encryptionReady(ctx)) };
       } catch (error) {
         if (!['OPENALEX_KEY_DECRYPT_FAILED', 'OPENALEX_ENCRYPTION_NOT_CONFIGURED'].includes(error.code)) throw error;
-        const stored = await ctx.db.get('system_settings', 'openalex_api_key');
         return {
           success: true,
           data: {
-            configured: Boolean(stored?.enabled),
-            source: stored?.enabled ? 'admin' : 'none',
+            configured: Boolean(ctx.env.OPENALEX_API_KEY),
+            source: ctx.env.OPENALEX_API_KEY ? 'environment' : 'none',
             maskedSuffix: null,
-            updatedAt: stored?.updated_at || null,
+            updatedAt: null,
             encryptionReady: encryptionReady(ctx),
             keyUnreadable: true,
           },

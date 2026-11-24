@@ -1,8 +1,16 @@
 import { HttpError } from '../core/http.js';
+import { appGet, appSet } from '../firestore/app-d1.js';
 
-const collection = 'system_settings';
-const documentId = 'openalex_api_key';
+const settingId = 'openalex_api_key';
 const encoder = new TextEncoder();
+
+async function getStoredKeyRecord(db) {
+  return appGet({ RANKINGS_DB: db }, 'system_settings', settingId);
+}
+
+async function setStoredKeyRecord(db, record) {
+  await appSet({ RANKINGS_DB: db }, 'system_settings', settingId, record);
+}
 
 function toBase64(bytes) {
   let binary = '';
@@ -24,7 +32,12 @@ async function encryptionKey(env) {
 }
 
 export async function readOpenAlexKey(ctx, { fallbackOnDecryptFailure = false } = {}) {
-  const stored = await ctx.db.get(collection, documentId);
+  let stored = null;
+  try { stored = await getStoredKeyRecord(ctx.env.RANKINGS_DB); }
+  catch (error) {
+    const missingAppStore = error?.code === 'APPLICATION_D1_NOT_CONFIGURED' || /no such table:\s*app_documents/i.test(String(error?.message || ''));
+    if (!missingAppStore) throw error;
+  }
   if (stored?.enabled && stored?.ciphertext && stored?.iv) {
     try {
       const key = await encryptionKey(ctx.env);
@@ -61,12 +74,12 @@ export async function saveOpenAlexKey(ctx, value) {
     updated_at: new Date().toISOString(),
     updated_by: String(ctx.user?.user_id || ctx.user?.id || ''),
   };
-  await ctx.db.set(collection, documentId, record);
+  await setStoredKeyRecord(ctx.env.RANKINGS_DB, record);
   return record;
 }
 
 export async function clearOpenAlexKey(ctx) {
-  await ctx.db.set(collection, documentId, {
+  await setStoredKeyRecord(ctx.env.RANKINGS_DB, {
     enabled: false,
     iv: null,
     ciphertext: null,

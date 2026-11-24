@@ -6,7 +6,6 @@ import { recordRoutes } from './features/records.js';
 import { projectRoutes } from './features/projects.js';
 import { accountBillingRoutes } from './features/accounts-billing.js';
 import { researchRoutes } from './features/research.js';
-import { chatRoutes } from './features/chat.js';
 import { openAlexAdminRoutes } from './features/openalex-admin.js';
 import { scimagoImportRoutes } from './features/scimago-import.js';
 import { id, nowIso } from './firestore/repository.js';
@@ -47,7 +46,16 @@ const baseRoutes = [
   } },
 ];
 
-const routes = defineRoutes([...baseRoutes, ...recordRoutes, ...projectRoutes, ...accountBillingRoutes, ...researchRoutes, ...chatRoutes, ...openAlexAdminRoutes, ...scimagoImportRoutes]);
+const disabledFeatureRoutes = defineRoutes([
+  { method: 'POST', path: '/chat', handler: async () => { throw new HttpError(410, 'Chat is disabled', 'FEATURE_DISABLED'); } },
+  { method: 'POST', path: '/projects/:projectId/chat/messages', handler: async () => { throw new HttpError(410, 'Chat is disabled', 'FEATURE_DISABLED'); } },
+  { method: 'GET', path: '/projects/:projectId/chat/messages', handler: async () => { throw new HttpError(410, 'Chat is disabled', 'FEATURE_DISABLED'); } },
+  { method: 'DELETE', path: '/projects/:projectId/chat/messages', handler: async () => { throw new HttpError(410, 'Chat is disabled', 'FEATURE_DISABLED'); } },
+  { method: 'GET', path: '/projects/:projectId/chat/messages/:messageId', handler: async () => { throw new HttpError(410, 'Chat is disabled', 'FEATURE_DISABLED'); } },
+  { method: 'PATCH', path: '/projects/:projectId/chat/messages/:messageId', handler: async () => { throw new HttpError(410, 'Chat is disabled', 'FEATURE_DISABLED'); } },
+  { method: 'DELETE', path: '/projects/:projectId/chat/messages/:messageId', handler: async () => { throw new HttpError(410, 'Chat is disabled', 'FEATURE_DISABLED'); } },
+]);
+const routes = defineRoutes([...baseRoutes, ...recordRoutes, ...projectRoutes, ...accountBillingRoutes, ...researchRoutes, ...disabledFeatureRoutes, ...openAlexAdminRoutes, ...scimagoImportRoutes]);
 const openApiPaths = {};
 for (const route of routes) {
   if (route.path.startsWith('/api-docs')) continue;

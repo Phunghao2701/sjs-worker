@@ -28,6 +28,12 @@ npx wrangler queues create sjs-analytics-dlq
 npx wrangler deploy
 ```
 
+Apply D1 schema changes before deploying code that uses application settings or job state:
+
+```sh
+npx wrangler d1 migrations apply sjs-scimago-rankings --remote
+```
+
 Deploy Firestore composite and vector indexes with Firebase CLI from this directory using `firebase deploy --only firestore:indexes`. Vector search requires a vector index whose dimension matches the stored embeddings; update `firestore.indexes.json` if your embeddings are not 768-dimensional.
 
 ## API coverage
@@ -40,7 +46,7 @@ Deploy Firestore composite and vector indexes with Firebase CLI from this direct
 - Chat RAG, scoped project history/message CRUD, Firestore statistics with multi-dimension groups and multiple aggregate metrics, Ollama local inference and OpenAI-compatible/Gemini remote providers.
 - Coin packages, wallet transactions/spending/adjustments, PayOS checkout/webhook and MoMo IPN.
 
-OpenAlex is the upstream source for scholarly works, authors, sources/journals, publishers, institutions, keywords, topics, domains, and fields. The Worker requests those records from OpenAlex, stores entity records and exact query pages in Firestore, and serves repeated queries from that cache for `OPENALEX_CACHE_TTL_SECONDS` (default six hours). On refresh it writes only new or changed entity documents and ignores an older `updated_date`. Set `OPENALEX_API_KEY` as a Wrangler secret; the key is sent in the Authorization header and is never put in cache keys or URLs. Firestore remains the source for accounts, projects, billing, and curated data OpenAlex does not provide, including SJR/quartile and volume/issue records.
+OpenAlex is the upstream source for scholarly works, authors, sources/journals, publishers, institutions, keywords, topics, domains, and fields. The Worker fetches scholarly entities and query pages directly from OpenAlex; it does not read or write an OpenAlex entity/query cache in Firestore. Work relationships (authorships, institutions, source, topics, keywords, and references) come from each OpenAlex work response. Volume and issue labels are derived from work bibliographic metadata because OpenAlex has no separate volume/issue endpoints. Set `OPENALEX_API_KEY` as a Wrangler secret or configure the encrypted admin override; encrypted key overrides and OpenAlex sync-job state use the D1 `app_documents` table after migration `0002_app_storage.sql` is applied. Firestore still holds project configuration and project-scoped work/keyword links. Existing non-project Firestore records from the legacy import have not been deleted or migrated by this change; the remaining account, billing, chat, and legacy analytics storage migration is still pending. SJR and quartile values remain sourced from SCImago in D1, joined to OpenAlex sources by ISSN.
 
 OpenAlex backs scholarly list/detail routes, global search/autocomplete, graph search, author/topic/keyword article lists, and dashboard project counts/publication trends/trending keywords. Dashboard aggregates query OpenAlex group counts from Firestore-stored project tracking IDs, using the existing Firestore read-through query cache. OpenAlex fields are adapted to existing response shapes, with OpenAlex IDs exposed alongside the numeric ID suffix used by existing routes. Journal list/detail responses join Firestore SJR, quartile, and volume-count data. Other advanced analytics still use Firestore article snapshots/relations in several branches and are not yet fully OpenAlex-backed. OpenAlex's `updated_date` filters are available to the configured Member+/Partner key; current request refreshes re-query the requested page and only persist changed entity documents.
 

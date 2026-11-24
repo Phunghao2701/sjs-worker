@@ -5,7 +5,6 @@ import { authenticate } from '../core/session.js';
 import { getOpenAlexEntity, listOpenAlexEntity, openAlexWorkToLegacy } from '../openalex/adapters.js';
 import { openAlexRequest } from '../openalex/client.js';
 import { loadProjectResearchScopes, openAlexPublicationTrends } from '../openalex/project-dashboard.js';
-import { d1ListAll, d1Query } from '../firestore/scimago-d1.js';
 
 const entities = [
   { paths: ['/articles'], name: 'articles', text: ['title', 'abstract', 'description', 'keywords', 'doi'], writes: true },
@@ -57,13 +56,13 @@ const applyFilters = (rows, query, textFields) => {
 const compare = (a, b) => Number(a ?? 0) - Number(b ?? 0) || String(a ?? '').localeCompare(String(b ?? ''));
 
 async function listEntity(ctx, entity) {
+  const openAlexKinds = new Set(['articles', 'authors', 'publishers', 'journals', 'keywords', 'subjectAreas', 'subjectCategories', 'topics']);
   let openAlexRows;
-  try {
+  if (openAlexKinds.has(entity.name)) {
     openAlexRows = entity.name === 'articles'
       ? await listOpenAlexIssueArticles(ctx) || await listOpenAlexEntity(ctx, entity.name)
       : await listOpenAlexEntity(ctx, entity.name);
-  } catch (err) {
-    console.error(`[openalex] list failed for ${entity.name}:`, err?.message || err);
+    if (!openAlexRows) throw new HttpError(502, `OpenAlex did not return ${entity.name}`, 'OPENALEX_RESPONSE_EMPTY');
   }
   if (openAlexRows) {
     if (entity.name !== 'journals') return openAlexRows;
@@ -72,6 +71,8 @@ async function listEntity(ctx, entity) {
     const enriched = await journalList({ ...ctx, query: { ...ctx.query, page: 1, limit: Math.max(1, sourceItems.length) } }, sourceItems);
     return { ...openAlexRows, data: { ...openAlexRows.data, items: enriched.data.items, pagination: openAlexRows.data.pagination } };
   }
+  if (entity.name === 'volumes') return catalogVolumes(ctx);
+  if (entity.name === 'issues') return catalogIssues(ctx);
   let source = await all(ctx.db, entity.name);
   if (entity.name === 'articles') source = await hydrateArticles(ctx.db, source);
   if (entity.name === 'articles') return listArticles(ctx, source);
@@ -86,12 +87,12 @@ async function listEntity(ctx, entity) {
   let rows = applyFilters(source, ctx.query, entity.text);
   const page = paginate(rows, ctx.query, entity.name === 'publishers' ? 100 : 10, 100);
   const pagination = { page: page.page, limit: page.limit, total: page.total, ...(entity.name === 'publishers' ? {} : { total_pages: page.totalPages }) };
-  if (entity.name === 'authors') return { success: true, code: 'AUTHOR_LIST_FETCHED', message: 'Lấy danh sách tác giả thành công', data: page.items, pagination };
-  if (entity.name === 'publishers') return { success: true, message: 'Lấy danh sách nhà xuất bản thành công', data: page.items, pagination };
-  if (entity.name === 'journals') return { success: true, message: 'Lấy danh sách journal thành công', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total } } };
-  if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_LIST_FETCHED', message: 'Lấy danh sách keyword thành công', data: page.items, pagination };
+  if (entity.name === 'authors') return { success: true, code: 'AUTHOR_LIST_FETCHED', message: 'Láº¥y danh sÃ¡ch tÃ¡c giáº£ thÃ nh cÃ´ng', data: page.items, pagination };
+  if (entity.name === 'publishers') return { success: true, message: 'Láº¥y danh sÃ¡ch nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng', data: page.items, pagination };
+  if (entity.name === 'journals') return { success: true, message: 'Láº¥y danh sÃ¡ch journal thÃ nh cÃ´ng', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total } } };
+  if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_LIST_FETCHED', message: 'Láº¥y danh sÃ¡ch keyword thÃ nh cÃ´ng', data: page.items, pagination };
   if (['subjectAreas', 'subjectCategories'].includes(entity.name)) return { success: true, code: entity.name === 'subjectAreas' ? 'GET_SUBJECT_AREAS_SUCCESS' : 'GET_SUBJECT_CATEGORIES_SUCCESS', message: `Fetch ${entity.name} successfully`, data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total } } };
-  if (entity.name === 'topics') return { success: true, code: 'GET_TOPICS_SUCCESS', message: 'Lấy danh sách Topic thành công', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total } } };
+  if (entity.name === 'topics') return { success: true, code: 'GET_TOPICS_SUCCESS', message: 'Láº¥y danh sÃ¡ch Topic thÃ nh cÃ´ng', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total } } };
   return ok(page, `Fetch ${entity.name} successfully`);
 }
 
@@ -146,7 +147,7 @@ async function listOpenAlexIssueArticles(ctx) {
 async function journalList(ctx, source) {
   const isEnriching = Array.isArray(source);
   if (isEnriching && source.length === 0) {
-    return { success: true, message: 'Lấy danh sách journal thành công', data: { items: [], pagination: { page: 1, limit: 10, total: 0 } } };
+    return { success: true, message: 'Láº¥y danh sÃ¡ch journal thÃ nh cÃ´ng', data: { items: [], pagination: { page: 1, limit: 10, total: 0 } } };
   }
 
   let publishers = [];
@@ -160,26 +161,7 @@ async function journalList(ctx, source) {
 
   if (isEnriching) {
     // High-performance enrichment: fetch small metadata and targeted rankings for source items only
-    const [publishersList, zonesList, metricsList, localJournals, importedMetrics] = await Promise.all([
-      all(ctx.db, 'publishers', 100),
-      all(ctx.db, 'zones', 100),
-      all(ctx.db, 'ranking_metrics', 50),
-      all(ctx.db, 'journals', 300),
-      ctx.env.RANKINGS_DB ? d1ListAll(ctx.env.RANKINGS_DB, 'ranking_metrics', 50) : Promise.resolve([]),
-    ]);
-    publishers = publishersList;
-    zones = zonesList;
-    rankingMetrics = [...metricsList, ...importedMetrics];
-
-    for (const lj of localJournals) {
-      const sId = String(lj.journal_id || lj.id);
-      if (lj.issn) scimagoIdByIssn.set(String(lj.issn).trim().toLowerCase(), sId);
-      if (lj.eissn) scimagoIdByIssn.set(String(lj.eissn).trim().toLowerCase(), sId);
-      if (Array.isArray(lj.issns)) {
-        for (const i of lj.issns) scimagoIdByIssn.set(String(i).trim().toLowerCase(), sId);
-      }
-    }
-
+    rankingMetrics = await all(ctx.db, 'ranking_metrics', 50);
     const targetJournalIds = new Set();
     for (const j of source) {
       const rawId = String(j.journal_id || j.id || '');
@@ -204,16 +186,6 @@ async function journalList(ctx, source) {
       }
       const rankingResults = await Promise.all(rankingQueries);
       rankingRows = rankingResults.flat();
-      if (ctx.env.RANKINGS_DB) {
-        const importedQueries = [];
-        for (let start = 0; start < journalIds.length; start += 25) {
-          importedQueries.push(d1Query(ctx.env.RANKINGS_DB, 'journal_rankings', {
-            filters: [{ field: 'journal_id', op: 'IN', value: journalIds.slice(start, start + 25) }],
-            limit: 1000,
-          }));
-        }
-        rankingRows.push(...(await Promise.all(importedQueries)).flat());
-      }
     }
   } else {
     // Local database fallback: bounded queries to prevent infinite pagination hanging
@@ -346,7 +318,7 @@ async function journalList(ctx, source) {
   const limit = Math.max(1, Math.trunc(number(ctx.query.limit, 10)));
   const offset = (page - 1) * limit;
   const items = isEnriching ? resultRows.map(({ __sort_metric, ...row }) => row) : resultRows.slice(offset, offset + limit).map(({ __sort_metric, ...row }) => row);
-  return { success: true, message: 'Lấy danh sách journal thành công', data: { items, pagination: { page, limit, total: resultRows.length } } };
+  return { success: true, message: 'Láº¥y danh sÃ¡ch journal thÃ nh cÃ´ng', data: { items, pagination: { page, limit, total: resultRows.length } } };
 }
 
 async function publisherList(ctx, source) {
@@ -357,7 +329,7 @@ async function publisherList(ctx, source) {
   const page = Math.max(1, Math.trunc(number(ctx.query.page, 1)));
   const limit = Math.max(1, Math.trunc(number(ctx.query.limit, 100)));
   const data = rows.slice((page - 1) * limit, page * limit).map(publisherProjection);
-  return { success: true, message: 'Lấy danh sách nhà xuất bản thành công', data, pagination: { page, limit, total: rows.length, total_pages: Math.ceil(rows.length / limit) } };
+  return { success: true, message: 'Láº¥y danh sÃ¡ch nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng', data, pagination: { page, limit, total: rows.length, total_pages: Math.ceil(rows.length / limit) } };
 }
 
 function uncappedPage(rows, query, defaultLimit = 10) {
@@ -373,7 +345,7 @@ async function subjectAreaList(ctx, source) {
   let rows = source.filter(row => row.is_deleted === false && (!search || String(row.display_name || '').toLowerCase().includes(search)));
   rows.sort((a, b) => direction * compare(a[sortBy] ?? a.id, b[sortBy] ?? b.id));
   const page = uncappedPage(rows, ctx.query);
-  return { success: true, message: 'Lấy danh sách subject area thành công', code: 'GET_SUBJECT_AREAS_SUCCESS', data: { items: page.items.map(row => ({ subject_area_id: String(row.subject_area_id || row.id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted })), pagination: { page: page.page, limit: page.limit, total: page.total } } };
+  return { success: true, message: 'Láº¥y danh sÃ¡ch subject area thÃ nh cÃ´ng', code: 'GET_SUBJECT_AREAS_SUCCESS', data: { items: page.items.map(row => ({ subject_area_id: String(row.subject_area_id || row.id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted })), pagination: { page: page.page, limit: page.limit, total: page.total } } };
 }
 
 async function subjectCategoryList(ctx, source) {
@@ -384,19 +356,19 @@ async function subjectCategoryList(ctx, source) {
   let rows = source.filter(row => row.is_deleted === false && (!areaId || String(row.subject_area_id) === String(areaId)) && (!search || String(row.display_name || '').toLowerCase().includes(search)));
   rows.sort((a, b) => direction * compare(a[sortBy] ?? a.id, b[sortBy] ?? b.id));
   const page = uncappedPage(rows, ctx.query);
-  return { success: true, message: 'Lấy danh sách subject category thành công', code: 'GET_SUBJECT_CATEGORIES_SUCCESS', data: { items: page.items.map(row => ({ subject_category_id: String(row.subject_category_id || row.id), subject_area_id: String(row.subject_area_id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted })), pagination: { page: page.page, limit: page.limit, total: page.total } } };
+  return { success: true, message: 'Láº¥y danh sÃ¡ch subject category thÃ nh cÃ´ng', code: 'GET_SUBJECT_CATEGORIES_SUCCESS', data: { items: page.items.map(row => ({ subject_category_id: String(row.subject_category_id || row.id), subject_area_id: String(row.subject_area_id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted })), pagination: { page: page.page, limit: page.limit, total: page.total } } };
 }
 
 async function topicList(ctx, source) {
   const [areas, categories] = await Promise.all([all(ctx.db, 'subjectAreas'), all(ctx.db, 'subjectCategories')]);
   for (const [filter, rows, key] of [['subject_area_id', areas, 'subject_area_id'], ['subject_category_id', categories, 'subject_category_id']]) {
-    if (ctx.query[filter] && !rows.some(row => String(row[key] || row.id) === String(ctx.query[filter]))) throw new HttpError(400, `${filter} không tồn tại`, 'INVALID_FILTER');
+    if (ctx.query[filter] && !rows.some(row => String(row[key] || row.id) === String(ctx.query[filter]))) throw new HttpError(400, `${filter} khÃ´ng tá»“n táº¡i`, 'INVALID_FILTER');
   }
   const areaById = new Map(areas.map(row => [String(row.subject_area_id || row.id), row]));
   const categoryById = new Map(categories.map(row => [String(row.subject_category_id || row.id), row]));
   const search = String(ctx.query.search || '').trim().toLowerCase();
   const sortBy = ['topic_id', 'display_name', 'score'].includes(ctx.query.sort_by) ? ctx.query.sort_by : 'display_name';
-  if (ctx.query.sort_by && !['topic_id', 'display_name', 'score'].includes(ctx.query.sort_by)) throw new HttpError(400, 'sort_by không hợp lệ', 'INVALID_FILTER');
+  if (ctx.query.sort_by && !['topic_id', 'display_name', 'score'].includes(ctx.query.sort_by)) throw new HttpError(400, 'sort_by khÃ´ng há»£p lá»‡', 'INVALID_FILTER');
   const direction = String(ctx.query.sort_order || 'asc').toLowerCase() === 'desc' ? -1 : 1;
   let rows = source.filter(row => row.is_deleted === false
     && (!ctx.query.subject_area_id || String(row.subject_area_id) === String(ctx.query.subject_area_id))
@@ -405,7 +377,7 @@ async function topicList(ctx, source) {
   rows.sort((a, b) => direction * compare(a[sortBy] ?? a.id, b[sortBy] ?? b.id));
   const page = uncappedPage(rows, ctx.query);
   const items = page.items.map(row => ({ topic_id: String(row.topic_id || row.id), display_name: row.display_name ?? null, score: row.score ?? null, subject_area_id: row.subject_area_id == null ? null : String(row.subject_area_id), subject_category_id: row.subject_category_id == null ? null : String(row.subject_category_id), is_deleted: row.is_deleted, subject_area_name: areaById.get(String(row.subject_area_id))?.display_name ?? null, subject_category_name: categoryById.get(String(row.subject_category_id))?.display_name ?? null }));
-  return { success: true, code: 'GET_TOPICS_SUCCESS', message: 'Lấy danh sách Topic thành công', data: { items, total: page.total } };
+  return { success: true, code: 'GET_TOPICS_SUCCESS', message: 'Láº¥y danh sÃ¡ch Topic thÃ nh cÃ´ng', data: { items, total: page.total } };
 }
 
 async function keywordList(ctx, source) {
@@ -438,7 +410,7 @@ async function keywordList(ctx, source) {
   } else {
     rows.sort((a, b) => String(a.display_name || a.name || a.keyword || '').localeCompare(String(b.display_name || b.name || b.keyword || '')));
   }
-  return { success: true, code: 'KEYWORD_LIST_FETCHED', message: 'Lấy danh sách keyword thành công', data: rows.slice((page - 1) * limit, page * limit).map(row => ({ keyword_id: String(row.keyword_id ?? row.id), display_name: row.display_name || row.name || row.keyword, ...(row.article_count !== undefined ? { article_count: row.article_count } : {}) })), pagination: { page, limit, total: rows.length, total_pages: areaFiltered ? Math.max(1, Math.ceil(rows.length / limit)) : Math.ceil(rows.length / limit) } };
+  return { success: true, code: 'KEYWORD_LIST_FETCHED', message: 'Láº¥y danh sÃ¡ch keyword thÃ nh cÃ´ng', data: rows.slice((page - 1) * limit, page * limit).map(row => ({ keyword_id: String(row.keyword_id ?? row.id), display_name: row.display_name || row.name || row.keyword, ...(row.article_count !== undefined ? { article_count: row.article_count } : {}) })), pagination: { page, limit, total: rows.length, total_pages: areaFiltered ? Math.max(1, Math.ceil(rows.length / limit)) : Math.ceil(rows.length / limit) } };
 }
 
 const publisherProjection = row => ({ publisher_id: String(row.publisher_id || row.id), display_name: row.display_name ?? null, image_url: row.image_url ?? null, created_at: row.created_at ?? null });
@@ -446,11 +418,11 @@ const publisherProjection = row => ({ publisher_id: String(row.publisher_id || r
 async function createPublisherRecord(ctx) {
   const { display_name, image_url } = ctx.body || {};
   if (typeof display_name !== 'string' || display_name.length < 1 || (image_url !== undefined && image_url !== null && typeof image_url !== 'string')) throw new HttpError(400, 'Invalid publisher fields', 'VALIDATION_ERROR');
-  if ((await all(ctx.db, 'publishers')).some(row => row.display_name === display_name)) throw new HttpError(400, 'Tên nhà xuất bản đã tồn tại', 'VALIDATION_ERROR');
+  if ((await all(ctx.db, 'publishers')).some(row => row.display_name === display_name)) throw new HttpError(400, 'TÃªn nhÃ  xuáº¥t báº£n Ä‘Ã£ tá»“n táº¡i', 'VALIDATION_ERROR');
   const key = id();
   const row = { id: key, publisher_id: key, display_name, image_url: image_url ?? null, is_deleted: false, created_at: nowIso() };
   await ctx.db.create('publishers', key, row);
-  return { body: { success: true, message: 'Tạo nhà xuất bản thành công', data: publisherProjection(row) }, status: 201 };
+  return { body: { success: true, message: 'Táº¡o nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng', data: publisherProjection(row) }, status: 201 };
 }
 
 function validateKeywordName(value) {
@@ -553,33 +525,33 @@ async function restoreKeywordRecord(ctx) {
 
 async function updatePublisherRecord(ctx) {
   const row = await byId(ctx.db, 'publishers', ctx.params.id);
-  if (!row || row.is_deleted !== false) throw new HttpError(404, 'Không tìm thấy nhà xuất bản để cập nhật', 'NOT_FOUND');
+  if (!row || row.is_deleted !== false) throw new HttpError(404, 'KhÃ´ng tÃ¬m tháº¥y nhÃ  xuáº¥t báº£n Ä‘á»ƒ cáº­p nháº­t', 'NOT_FOUND');
   const { display_name, image_url } = ctx.body || {};
   if (display_name !== undefined && (typeof display_name !== 'string' || display_name.length < 1)) throw new HttpError(400, 'Invalid display_name', 'VALIDATION_ERROR');
   if (image_url !== undefined && image_url !== null && typeof image_url !== 'string') throw new HttpError(400, 'Invalid image_url', 'VALIDATION_ERROR');
-  if (display_name !== undefined && (await all(ctx.db, 'publishers')).some(item => String(item.id || item.publisher_id) !== String(row.id || row.publisher_id) && item.display_name === display_name)) throw new HttpError(400, 'Tên nhà xuất bản đã tồn tại', 'VALIDATION_ERROR');
+  if (display_name !== undefined && (await all(ctx.db, 'publishers')).some(item => String(item.id || item.publisher_id) !== String(row.id || row.publisher_id) && item.display_name === display_name)) throw new HttpError(400, 'TÃªn nhÃ  xuáº¥t báº£n Ä‘Ã£ tá»“n táº¡i', 'VALIDATION_ERROR');
   const updated = { ...row, ...(display_name != null ? { display_name } : {}), ...(image_url != null ? { image_url } : {}) };
   await ctx.db.set('publishers', row.id || ctx.params.id, updated);
-  return { success: true, message: 'Cập nhật nhà xuất bản thành công', data: publisherProjection(updated) };
+  return { success: true, message: 'Cáº­p nháº­t nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng', data: publisherProjection(updated) };
 }
 
 async function deletePublisherRecord(ctx) {
   const row = await byId(ctx.db, 'publishers', ctx.params.id);
-  if (!row) throw new HttpError(404, 'Không tìm thấy nhà xuất bản', 'NOT_FOUND');
-  if (row.is_deleted === true) throw new HttpError(400, 'Nhà xuất bản đã bị xóa từ trước', 'ALREADY_DELETED');
+  if (!row) throw new HttpError(404, 'KhÃ´ng tÃ¬m tháº¥y nhÃ  xuáº¥t báº£n', 'NOT_FOUND');
+  if (row.is_deleted === true) throw new HttpError(400, 'NhÃ  xuáº¥t báº£n Ä‘Ã£ bá»‹ xÃ³a tá»« trÆ°á»›c', 'ALREADY_DELETED');
   const [journals, references] = await Promise.all([all(ctx.db, 'journals'), all(ctx.db, 'articles')]);
-  if (journals.some(item => String(item.publisher_id) === String(row.publisher_id || row.id)) || references.some(item => String(item.publisher_id) === String(row.publisher_id || row.id))) throw new HttpError(400, 'Không thể xóa nhà xuất bản vì đang có thực thể liên kết', 'VALIDATION_ERROR');
+  if (journals.some(item => String(item.publisher_id) === String(row.publisher_id || row.id)) || references.some(item => String(item.publisher_id) === String(row.publisher_id || row.id))) throw new HttpError(400, 'KhÃ´ng thá»ƒ xÃ³a nhÃ  xuáº¥t báº£n vÃ¬ Ä‘ang cÃ³ thá»±c thá»ƒ liÃªn káº¿t', 'VALIDATION_ERROR');
   await ctx.db.set('publishers', row.id || ctx.params.id, { ...row, is_deleted: true });
-  return { success: true, message: 'Xóa nhà xuất bản thành công' };
+  return { success: true, message: 'XÃ³a nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng' };
 }
 
 async function restorePublisherRecord(ctx) {
   const row = await byId(ctx.db, 'publishers', ctx.params.id);
-  if (!row) throw new HttpError(404, 'Không tìm thấy nhà xuất bản', 'NOT_FOUND');
-  if (row.is_deleted !== true) throw new HttpError(400, 'Nhà xuất bản đang hoạt động, không cần khôi phục', 'NOT_DELETED');
+  if (!row) throw new HttpError(404, 'KhÃ´ng tÃ¬m tháº¥y nhÃ  xuáº¥t báº£n', 'NOT_FOUND');
+  if (row.is_deleted !== true) throw new HttpError(400, 'NhÃ  xuáº¥t báº£n Ä‘ang hoáº¡t Ä‘á»™ng, khÃ´ng cáº§n khÃ´i phá»¥c', 'NOT_DELETED');
   const restored = { ...row, is_deleted: false };
   await ctx.db.set('publishers', row.id || ctx.params.id, restored);
-  return { success: true, message: 'Khôi phục nhà xuất bản thành công', data: publisherProjection(restored) };
+  return { success: true, message: 'KhÃ´i phá»¥c nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng', data: publisherProjection(restored) };
 }
 
 async function listArticles(ctx, source) {
@@ -618,7 +590,7 @@ async function listArticles(ctx, source) {
       article_id: String(row.article_id || row.id), title: row.title ?? null, abstract: row.abstract ?? null,
       publication_year: row.publication_year ?? null, doi: row.doi ?? null, created_at: row.created_at ?? null,
     }));
-    return { success: true, code: 'ARTICLES_GET_BY_KEYWORDS_SUCCESS', message: 'Lấy danh sách bài báo thành công!', data: { articles, pagination: { total, page, limit, total_pages: Math.ceil(total / limit) } } };
+    return { success: true, code: 'ARTICLES_GET_BY_KEYWORDS_SUCCESS', message: 'Láº¥y danh sÃ¡ch bÃ i bÃ¡o thÃ nh cÃ´ng!', data: { articles, pagination: { total, page, limit, total_pages: Math.ceil(total / limit) } } };
   }
 
   let rows = source.filter(row => !isDeleted(row));
@@ -657,7 +629,7 @@ async function listArticles(ctx, source) {
     authorsCount: new Set(authorLinks.map(row => String(row.author_id))).size || authors.filter(row => !isDeleted(row)).length,
     topicsCount: new Set(topicLinks.map(row => String(row.topic_id))).size || topics.filter(row => !isDeleted(row)).length,
   };
-  return { success: true, code: 'ARTICLES_GET_SUCCESS', message: 'Lấy danh sách bài báo thành công!', data: { articles: page.items, items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: page.totalPages }, stats } };
+  return { success: true, code: 'ARTICLES_GET_SUCCESS', message: 'Láº¥y danh sÃ¡ch bÃ i bÃ¡o thÃ nh cÃ´ng!', data: { articles: page.items, items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: page.totalPages }, stats } };
 }
 
 async function listVolumeIssueEntity(ctx, name, source) {
@@ -692,7 +664,7 @@ async function listSourceVolumes(ctx, source) {
     volume_id: String(row.volume_id || row.id), journal_id: row.journal_id == null ? null : String(row.journal_id),
     volume_number: row.volume_number, publication_year: row.publication_year, is_deleted: row.is_deleted,
   }));
-  return { success: true, code: 'GET_VOLUMES_SUCCESS', message: 'Lấy danh sách volume thành công', data: { items, pagination: { page, limit, total: rows.length } } };
+  return { success: true, code: 'GET_VOLUMES_SUCCESS', message: 'Láº¥y danh sÃ¡ch volume thÃ nh cÃ´ng', data: { items, pagination: { page, limit, total: rows.length } } };
 }
 
 async function listSourceIssues(ctx, source) {
@@ -714,7 +686,7 @@ async function listSourceIssues(ctx, source) {
     const volume = volumeById.get(String(row.volume_id));
     return { issue_id: String(row.issue_id || row.id), volume_id: String(row.volume_id), issue_number: row.issue_number, publication_year: row.publication_year, journal_id: volume.journal_id == null ? null : String(volume.journal_id), volume_number: volume.volume_number };
   });
-  return { success: true, message: 'Lấy danh sách Issue thành công', data: items, pagination: { page, limit, total: rows.length, totalPages: Math.ceil(rows.length / limit) } };
+  return { success: true, message: 'Láº¥y danh sÃ¡ch Issue thÃ nh cÃ´ng', data: items, pagination: { page, limit, total: rows.length, totalPages: Math.ceil(rows.length / limit) } };
 }
 
 async function createVolumeIssue(ctx, name) {
@@ -730,7 +702,7 @@ async function createVolumeIssue(ctx, name) {
     const key = await allocateNumericRecordId(ctx.db, 'volumes', 'volume_id');
     const row = { id: key, volume_id: Number(key), journal_id: Number(journalId), volume_number: number, publication_year: year, is_deleted: false, created_at: nowIso() };
     await ctx.db.create('volumes', key, row);
-    return { body: { success: true, code: 'CREATE_VOLUME_SUCCESS', message: 'Tạo Volume thành công', data: row }, status: 201 };
+    return { body: { success: true, code: 'CREATE_VOLUME_SUCCESS', message: 'Táº¡o Volume thÃ nh cÃ´ng', data: row }, status: 201 };
   }
   const volumeId = String(ctx.body.volume_id || '');
   const number = Number(ctx.body.issue_number);
@@ -743,7 +715,7 @@ async function createVolumeIssue(ctx, name) {
   const key = await allocateNumericRecordId(ctx.db, 'issues', 'issue_id');
   const row = { id: key, issue_id: Number(key), volume_id: Number(volumeId), issue_number: number, publication_year: year, is_deleted: false, created_at: nowIso() };
   await ctx.db.create('issues', key, row);
-  return { body: { success: true, code: 'CREATE_ISSUE_SUCCESS', message: 'Tạo Issue thành công', data: row }, status: 201 };
+  return { body: { success: true, code: 'CREATE_ISSUE_SUCCESS', message: 'Táº¡o Issue thÃ nh cÃ´ng', data: row }, status: 201 };
 }
 
 const volumeIssueProjection = (row, name) => name === 'volumes'
@@ -762,7 +734,7 @@ async function updateVolumeIssue(ctx, name) {
   const parentId = String(name === 'volumes' ? row.journal_id : row.volume_id);
   const duplicate = await find(ctx.db, name, item => item.is_deleted === false && String(item[keyName] || item.id) !== String(row[keyName] || row.id) && String(name === 'volumes' ? item.journal_id : item.volume_id) === parentId && Number(item[numberField]) === Number(nextNumber), { limit: 1 });
   if (duplicate.length) throw new HttpError(400, `${name === 'volumes' ? 'Volume' : 'Issue'} number already exists`, name === 'volumes' ? 'DUPLICATE_VOLUME' : 'DUPLICATE_ISSUE');
-  if (ctx.body[numberField] === undefined && ctx.body.publication_year === undefined) return { success: true, code: name === 'volumes' ? 'UPDATE_VOLUME_SUCCESS' : 'UPDATE_ISSUE_SUCCESS', message: `Cập nhật ${name === 'volumes' ? 'Volume' : 'Issue'} thành công`, data: null };
+  if (ctx.body[numberField] === undefined && ctx.body.publication_year === undefined) return { success: true, code: name === 'volumes' ? 'UPDATE_VOLUME_SUCCESS' : 'UPDATE_ISSUE_SUCCESS', message: `Cáº­p nháº­t ${name === 'volumes' ? 'Volume' : 'Issue'} thÃ nh cÃ´ng`, data: null };
   const updated = { ...row, [numberField]: nextNumber, ...(ctx.body.publication_year === undefined ? {} : { publication_year: Number(ctx.body.publication_year) }), updated_at: nowIso() };
   await ctx.db.set(collectionFor(name), row.id || String(ctx.params.id), updated);
   return { success: true, code: name === 'volumes' ? 'UPDATE_VOLUME_SUCCESS' : 'UPDATE_ISSUE_SUCCESS', message: `${name === 'volumes' ? 'Volume' : 'Issue'} updated successfully`, data: volumeIssueProjection(updated, name) };
@@ -823,35 +795,31 @@ async function journalDetail(ctx, idValue) {
     quartile: quartile?.value_txt || null, metric_value: getValue(sjr), metric_name: sjr?.display_name || 'SJR Score', metric_year: sjr?.year ? String(sjr.year) : null,
     h_index: getValue(hIndex), cite_score: getValue(citeScore), latest_metrics: { year: sjr?.year || hIndex?.year || citeScore?.year || quartile?.year || null, sjr: getValue(sjr), h_index: getValue(hIndex), cite_score: getValue(citeScore), quartile: quartile?.value_txt || null },
   };
-  return { success: true, message: 'Láº¥y journal thÃ nh cÃ´ng', data };
+  return { success: true, message: 'LÃ¡ÂºÂ¥y journal thÃƒÂ nh cÃƒÂ´ng', data };
 }
 
 async function taxonomyDetail(ctx, name, idValue, row) {
   const notFoundCode = name === 'topics' ? 'TOPIC_NOT_FOUND' : name === 'subjectAreas' ? 'SUBJECT_AREA_NOT_FOUND' : 'SUBJECT_CATEGORY_NOT_FOUND';
   if (row.is_deleted !== false) throw new HttpError(404, `${entityLabel(name)} not found`, notFoundCode);
-  if (name === 'subjectAreas') return { success: true, message: 'Lấy chi tiết subject area thành công', code: 'GET_SUBJECT_AREA_SUCCESS', data: { subject_area_id: String(row.subject_area_id || row.id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted } };
+  if (name === 'subjectAreas') return { success: true, message: 'Láº¥y chi tiáº¿t subject area thÃ nh cÃ´ng', code: 'GET_SUBJECT_AREA_SUCCESS', data: { subject_area_id: String(row.subject_area_id || row.id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted } };
   const [areas, categories] = await Promise.all([all(ctx.db, 'subjectAreas'), all(ctx.db, 'subjectCategories')]);
   if (name === 'subjectCategories') {
     const area = areas.find(item => String(item.subject_area_id || item.id) === String(row.subject_area_id));
-    return { success: true, message: 'Lấy chi tiết subject category thành công', code: 'GET_SUBJECT_CATEGORY_SUCCESS', data: { subject_category_id: String(row.subject_category_id || row.id), subject_area_id: String(row.subject_area_id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted, subject_area_name: area?.display_name ?? null } };
+    return { success: true, message: 'Láº¥y chi tiáº¿t subject category thÃ nh cÃ´ng', code: 'GET_SUBJECT_CATEGORY_SUCCESS', data: { subject_category_id: String(row.subject_category_id || row.id), subject_area_id: String(row.subject_area_id), display_name: row.display_name ?? null, description: row.description ?? null, is_deleted: row.is_deleted, subject_area_name: area?.display_name ?? null } };
   }
   const area = areas.find(item => String(item.subject_area_id || item.id) === String(row.subject_area_id));
   const category = categories.find(item => String(item.subject_category_id || item.id) === String(row.subject_category_id));
-  return { success: true, message: 'Lấy chi tiết Topic thành công', code: 'GET_TOPIC_SUCCESS', data: { topic_id: String(row.topic_id || idValue), display_name: row.display_name ?? null, score: row.score ?? null, subject_area_id: row.subject_area_id == null ? null : String(row.subject_area_id), subject_category_id: row.subject_category_id == null ? null : String(row.subject_category_id), is_deleted: row.is_deleted, subject_area_name: area?.display_name ?? null, subject_category_name: category?.display_name ?? null } };
+  return { success: true, message: 'Láº¥y chi tiáº¿t Topic thÃ nh cÃ´ng', code: 'GET_TOPIC_SUCCESS', data: { topic_id: String(row.topic_id || idValue), display_name: row.display_name ?? null, score: row.score ?? null, subject_area_id: row.subject_area_id == null ? null : String(row.subject_area_id), subject_category_id: row.subject_category_id == null ? null : String(row.subject_category_id), is_deleted: row.is_deleted, subject_area_name: area?.display_name ?? null, subject_category_name: category?.display_name ?? null } };
 }
 
 async function getEntity(ctx, entity) {
-  let openAlexRow = null;
-  try {
-    openAlexRow = await getOpenAlexEntity(ctx, entity.name);
-  } catch (error) {
-    if (!(error instanceof HttpError) || error.details?.upstream_status !== 404) throw error;
-  }
+  const openAlexKinds = new Set(['articles', 'authors', 'publishers', 'journals', 'keywords', 'subjectAreas', 'subjectCategories', 'topics']);
+  const openAlexRow = openAlexKinds.has(entity.name) ? await getOpenAlexEntity(ctx, entity.name) : null;
   if (openAlexRow) {
-    if (entity.name === 'articles') return { success: true, code: 'ARTICLE_GET_SUCCESS', message: 'Láº¥y thÃ´ng tin bÃ i bÃ¡o thÃ nh cÃ´ng!', data: { ...openAlexRow, keywords: openAlexRow.keyword_objects || [] } };
-    if (entity.name === 'authors') return { success: true, code: 'AUTHOR_FETCHED', message: 'Láº¥y thÃ´ng tin tÃ¡c giáº£ thÃ nh cÃ´ng', data: authorProjection(openAlexRow) };
-    if (entity.name === 'publishers') return { success: true, message: 'Láº¥y thÃ´ng tin nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng', data: publisherProjection(openAlexRow) };
-    if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_FETCHED', message: 'Láº¥y keyword thÃ nh cÃ´ng', data: { keyword_id: String(openAlexRow.keyword_id), display_name: openAlexRow.display_name } };
+    if (entity.name === 'articles') return { success: true, code: 'ARTICLE_GET_SUCCESS', message: 'LÃ¡ÂºÂ¥y thÃƒÂ´ng tin bÃƒÂ i bÃƒÂ¡o thÃƒÂ nh cÃƒÂ´ng!', data: { ...openAlexRow, keywords: openAlexRow.keyword_objects || [] } };
+    if (entity.name === 'authors') return { success: true, code: 'AUTHOR_FETCHED', message: 'LÃ¡ÂºÂ¥y thÃƒÂ´ng tin tÃƒÂ¡c giÃ¡ÂºÂ£ thÃƒÂ nh cÃƒÂ´ng', data: authorProjection(openAlexRow) };
+    if (entity.name === 'publishers') return { success: true, message: 'LÃ¡ÂºÂ¥y thÃƒÂ´ng tin nhÃƒÂ  xuÃ¡ÂºÂ¥t bÃ¡ÂºÂ£n thÃƒÂ nh cÃƒÂ´ng', data: publisherProjection(openAlexRow) };
+    if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_FETCHED', message: 'LÃ¡ÂºÂ¥y keyword thÃƒÂ nh cÃƒÂ´ng', data: { keyword_id: String(openAlexRow.keyword_id), display_name: openAlexRow.display_name } };
     if (entity.name === 'journals') {
       const enriched = await journalList({ ...ctx, query: { page: 1, limit: 1 } }, [openAlexRow]);
       const localJournal = enriched.data.items[0] || {};
@@ -871,19 +839,21 @@ async function getEntity(ctx, entity) {
         quartile_year: localJournal.quartile_year ?? null, volume_count: localJournal.volume_count ?? 0,
       } };
     }
-    if (entity.name === 'topics') return { success: true, code: 'GET_TOPIC_SUCCESS', message: 'Láº¥y chi tiáº¿t Topic thÃ nh cÃ´ng', data: openAlexRow };
+    if (entity.name === 'topics') return { success: true, code: 'GET_TOPIC_SUCCESS', message: 'LÃ¡ÂºÂ¥y chi tiÃ¡ÂºÂ¿t Topic thÃƒÂ nh cÃƒÂ´ng', data: openAlexRow };
     if (entity.name === 'subjectAreas') return { success: true, code: 'GET_SUBJECT_AREA_SUCCESS', message: 'Fetched subject area from OpenAlex', data: openAlexRow };
     if (entity.name === 'subjectCategories') return { success: true, code: 'GET_SUBJECT_CATEGORY_SUCCESS', message: 'Fetched subject category from OpenAlex', data: openAlexRow };
   }
+  if (openAlexKinds.has(entity.name)) throw new HttpError(404, `${entity.name} not found`, entity.name === 'articles' ? 'ARTICLE_NOT_FOUND' : entity.name === 'keywords' ? 'KEYWORD_NOT_FOUND' : entity.name === 'authors' ? 'AUTHOR_NOT_FOUND' : 'NOT_FOUND');
+  if (['volumes', 'issues'].includes(entity.name)) return getOpenAlexVolumeIssue(ctx, entity.name);
   let row = await byId(ctx.db, entity.name, ctx.params.id);
   if (!row) throw new HttpError(404, `${entity.name} not found`, entity.name === 'articles' ? 'ARTICLE_NOT_FOUND' : entity.name === 'keywords' ? 'KEYWORD_NOT_FOUND' : entity.name === 'authors' ? 'AUTHOR_NOT_FOUND' : 'NOT_FOUND');
   if (entity.name === 'journals') return journalDetail(ctx, ctx.params.id);
-  if (entity.name === 'authors') return { success: true, code: 'AUTHOR_FETCHED', message: 'Lấy thông tin tác giả thành công', data: authorProjection(row) };
+  if (entity.name === 'authors') return { success: true, code: 'AUTHOR_FETCHED', message: 'Láº¥y thÃ´ng tin tÃ¡c giáº£ thÃ nh cÃ´ng', data: authorProjection(row) };
   if (entity.name === 'publishers') {
-    if (row.is_deleted !== false) throw new HttpError(404, 'Không tìm thấy nhà xuất bản', 'NOT_FOUND');
-    return { success: true, message: 'Lấy thông tin nhà xuất bản thành công', data: publisherProjection(row) };
+    if (row.is_deleted !== false) throw new HttpError(404, 'KhÃ´ng tÃ¬m tháº¥y nhÃ  xuáº¥t báº£n', 'NOT_FOUND');
+    return { success: true, message: 'Láº¥y thÃ´ng tin nhÃ  xuáº¥t báº£n thÃ nh cÃ´ng', data: publisherProjection(row) };
   }
-  if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_FETCHED', message: 'Lấy keyword thành công', data: { keyword_id: String(row.keyword_id ?? row.id), display_name: row.display_name || row.name || row.keyword } };
+  if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_FETCHED', message: 'Láº¥y keyword thÃ nh cÃ´ng', data: { keyword_id: String(row.keyword_id ?? row.id), display_name: row.display_name || row.name || row.keyword } };
   if (entity.name === 'volumes') {
     if (row.is_deleted !== false) throw new HttpError(404, 'Volume not found', 'VOLUME_NOT_FOUND');
     return { success: true, code: 'GET_VOLUME_DETAIL_SUCCESS', message: 'Volume details fetched successfully', data: volumeIssueProjection(row, 'volumes') };
@@ -899,15 +869,15 @@ async function getEntity(ctx, entity) {
   if (entity.name === 'articles') {
     row = (await hydrateArticles(ctx.db, [row]))[0];
     row = { ...row, keywords: row.keyword_objects || [] };
-    return { success: true, code: 'ARTICLE_GET_SUCCESS', message: 'Lấy thông tin bài báo thành công!', data: row };
+    return { success: true, code: 'ARTICLE_GET_SUCCESS', message: 'Láº¥y thÃ´ng tin bÃ i bÃ¡o thÃ nh cÃ´ng!', data: row };
   }
-  if (entity.name === 'volumes') return { success: true, code: 'GET_VOLUME_DETAIL_SUCCESS', message: 'Lấy chi tiết volume thành công', data: row };
-  if (entity.name === 'issues') return { success: true, code: 'GET_ISSUE_DETAIL_SUCCESS', message: 'Lấy chi tiết Issue thành công', data: row };
-  if (entity.name === 'authors') return { success: true, code: 'AUTHOR_FETCHED', message: 'Lấy thông tin tác giả thành công', data: row };
-  if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_FETCHED', message: 'Lấy keyword thành công', data: row };
-  if (entity.name === 'topics') return { success: true, code: 'GET_TOPIC_SUCCESS', message: 'Lấy chi tiết Topic thành công', data: row };
-  if (entity.name === 'subjectAreas') return { success: true, code: 'GET_SUBJECT_AREA_SUCCESS', message: 'Lấy chi tiết subject area thành công', data: row };
-  if (entity.name === 'subjectCategories') return { success: true, code: 'GET_SUBJECT_CATEGORY_SUCCESS', message: 'Lấy chi tiết subject category thành công', data: row };
+  if (entity.name === 'volumes') return { success: true, code: 'GET_VOLUME_DETAIL_SUCCESS', message: 'Láº¥y chi tiáº¿t volume thÃ nh cÃ´ng', data: row };
+  if (entity.name === 'issues') return { success: true, code: 'GET_ISSUE_DETAIL_SUCCESS', message: 'Láº¥y chi tiáº¿t Issue thÃ nh cÃ´ng', data: row };
+  if (entity.name === 'authors') return { success: true, code: 'AUTHOR_FETCHED', message: 'Láº¥y thÃ´ng tin tÃ¡c giáº£ thÃ nh cÃ´ng', data: row };
+  if (entity.name === 'keywords') return { success: true, code: 'KEYWORD_FETCHED', message: 'Láº¥y keyword thÃ nh cÃ´ng', data: row };
+  if (entity.name === 'topics') return { success: true, code: 'GET_TOPIC_SUCCESS', message: 'Láº¥y chi tiáº¿t Topic thÃ nh cÃ´ng', data: row };
+  if (entity.name === 'subjectAreas') return { success: true, code: 'GET_SUBJECT_AREA_SUCCESS', message: 'Láº¥y chi tiáº¿t subject area thÃ nh cÃ´ng', data: row };
+  if (entity.name === 'subjectCategories') return { success: true, code: 'GET_SUBJECT_CATEGORY_SUCCESS', message: 'Láº¥y chi tiáº¿t subject category thÃ nh cÃ´ng', data: row };
   return ok(row, `Fetch ${entity.name} detail successfully`, entityCode(entity.name, 'GET'));
 }
 
@@ -929,7 +899,7 @@ async function createArticle(ctx) {
   const articleId = await allocateNumericRecordId(ctx.db, 'articles', 'article_id');
   const article = await save(ctx.db, 'articles', articleId, { article_id: Number(articleId), title, publication_year, version, issue_id, abstract, doi, primary_topic: resolvedPrimaryTopic, status: ctx.body.status || 'ACTIVE', created_by: ctx.user.user_id }, { create: true });
   await replaceArticleLinks(ctx.db, articleId, { authors: authorIds, topics: sub_topic || [], keywords: keywords || [], primaryTopic: article.primary_topic });
-  return { body: { success: true, code: 'ARTICLE_CREATE_SUCCESS', message: 'Bài báo đã được tạo thành công!', data: await hydrateArticles(ctx.db, [article]).then(rows => rows[0]) }, status: 201 };
+  return { body: { success: true, code: 'ARTICLE_CREATE_SUCCESS', message: 'BÃ i bÃ¡o Ä‘Ã£ Ä‘Æ°á»£c táº¡o thÃ nh cÃ´ng!', data: await hydrateArticles(ctx.db, [article]).then(rows => rows[0]) }, status: 201 };
 }
 
 async function updateArticle(ctx) {
@@ -970,7 +940,7 @@ async function updateArticle(ctx) {
 async function deleteArticle(ctx) {
   if (!validJournalId(ctx.params.id)) throw new HttpError(400, 'Invalid article ID', 'VALIDATION_ERROR');
   await deleteSoft(ctx.db, 'articles', ctx.params.id, { is_deleted: true, deleted_by: ctx.user.user_id });
-  return ok(undefined, 'Article đã xóa thành công', 'ARTICLE_DELETE_SUCCESS');
+  return ok(undefined, 'Article Ä‘Ã£ xÃ³a thÃ nh cÃ´ng', 'ARTICLE_DELETE_SUCCESS');
 }
 
 async function restoreArticle(ctx) {
@@ -979,7 +949,7 @@ async function restoreArticle(ctx) {
   if (row.is_deleted !== true) throw new HttpError(404, 'Article not found or already restored', 'ARTICLE_NOT_FOUND');
   const article = { ...row, is_deleted: false, deleted_at: null, updated_at: nowIso() };
   await ctx.db.set(collectionFor('articles'), row.id || ctx.params.id, article);
-  return ok(article, 'Article đã khôi phục thành công', 'ARTICLE_RESTORE_SUCCESS');
+  return ok(article, 'Article Ä‘Ã£ khÃ´i phá»¥c thÃ nh cÃ´ng', 'ARTICLE_RESTORE_SUCCESS');
 }
 
 const entityIdField = name => ({ authors: 'author_id', publishers: 'publisher_id', journals: 'journal_id', keywords: 'keyword_id', subjectAreas: 'subject_area_id', subjectCategories: 'subject_category_id', topics: 'topic_id', volumes: 'volume_id', issues: 'issue_id' })[name] || 'id';
@@ -1269,7 +1239,7 @@ async function filterOptions(ctx) {
   return {
     success: true,
     code: 'ARTICLE_FILTER_OPTIONS_SUCCESS',
-    message: 'Lấy tùy chọn bộ lọc bài báo thành công!',
+    message: 'Láº¥y tÃ¹y chá»n bá»™ lá»c bÃ i bÃ¡o thÃ nh cÃ´ng!',
     data: {
       years,
       journals,
@@ -1339,7 +1309,7 @@ async function related(ctx, entityName, relationshipField = null) {
   }).filter(row => !isDeleted(row));
   const page = paginate(rows, ctx.query, 10, entityName === 'keywords' ? 50 : 100);
   const code = entityName === 'authors' ? 'AUTHOR_ARTICLES_FETCHED' : entityName === 'keywords' ? 'KEYWORD_ARTICLES_FETCHED' : 'GET_ARTICLES_BY_TOPIC_SUCCESS';
-  return { success: true, code, message: 'Lấy bài viết liên quan thành công', data: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: page.totalPages } };
+  return { success: true, code, message: 'Láº¥y bÃ i viáº¿t liÃªn quan thÃ nh cÃ´ng', data: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: page.totalPages } };
 }
 
 async function topicArticles(ctx) {
@@ -1348,7 +1318,7 @@ async function topicArticles(ctx) {
     const topicId = String(openAlexTopic.topic_id || ctx.params.id);
     const result = await listOpenAlexEntity({ ...ctx, query: { ...ctx.query, topic_id: topicId, sort: 'publication_year:desc' } }, 'articles');
     const page = result.data;
-    return { success: true, message: 'Lấy danh sách bài báo theo topic thành công', data: {
+    return { success: true, message: 'Láº¥y danh sÃ¡ch bÃ i bÃ¡o theo topic thÃ nh cÃ´ng', data: {
       topic: { topic_id: topicId, display_name: openAlexTopic.display_name ?? null },
       articles: page.articles.map(row => ({ article_id: String(row.article_id), title: row.title ?? null, publication_year: row.publication_year ?? null, doi: row.doi ?? null })),
       pagination: { page: page.pagination.page, limit: page.pagination.limit, total: page.pagination.total },
@@ -1369,7 +1339,7 @@ async function topicArticles(ctx) {
     return yearOrder || compare(b.article_id || b.id, a.article_id || a.id);
   });
   const page = uncappedPage(rows, ctx.query);
-  return { success: true, message: 'Lấy danh sách bài báo theo topic thành công', data: { topic: { topic_id: topicId, display_name: topic.display_name ?? null }, articles: page.items.map(row => ({ article_id: String(row.article_id || row.id), title: row.title ?? null, publication_year: row.publication_year ?? null, doi: row.doi ?? null })), pagination: { page: page.page, limit: page.limit, total: page.total } } };
+  return { success: true, message: 'Láº¥y danh sÃ¡ch bÃ i bÃ¡o theo topic thÃ nh cÃ´ng', data: { topic: { topic_id: topicId, display_name: topic.display_name ?? null }, articles: page.items.map(row => ({ article_id: String(row.article_id || row.id), title: row.title ?? null, publication_year: row.publication_year ?? null, doi: row.doi ?? null })), pagination: { page: page.page, limit: page.limit, total: page.total } } };
 }
 
 async function keywordArticles(ctx) {
@@ -1387,7 +1357,7 @@ async function keywordArticles(ctx) {
     const result = openAlexResult.data;
     const items = result.articles.map(row => ({ article_id: String(row.article_id), title: row.title ?? null, abstract: row.abstract ?? null,
       publication_year: row.publication_year ?? null, doi: row.doi ?? null, journal_name: row.journal_name ?? null, citations_count: number(row.citation_count) }));
-    return { success: true, code: 'KEYWORD_ARTICLES_FETCHED', message: 'Lấy danh sách bài báo theo keyword thành công', data: items,
+    return { success: true, code: 'KEYWORD_ARTICLES_FETCHED', message: 'Láº¥y danh sÃ¡ch bÃ i bÃ¡o theo keyword thÃ nh cÃ´ng', data: items,
       pagination: { page: result.pagination.page, limit: result.pagination.limit, total: result.pagination.total, total_pages: Math.max(1, result.pagination.total_pages) } };
   }
   const [links, articles, issues, volumes, journals] = await Promise.all(['keyword_articles', 'articles', 'issues', 'volumes', 'journals'].map(name => all(ctx.db, name)));
@@ -1410,7 +1380,7 @@ async function keywordArticles(ctx) {
     const journal = journalById.get(String(volume?.journal_id || ''));
     return { article_id: String(row.article_id || row.id), title: row.title ?? null, abstract: row.abstract ?? null, publication_year: row.publication_year ?? null, doi: row.doi ?? null, journal_name: journal?.display_name ?? null, citations_count: 0 };
   });
-  return { success: true, code: 'KEYWORD_ARTICLES_FETCHED', message: 'Lấy danh sách bài báo theo keyword thành công', data: pageItems, pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) } };
+  return { success: true, code: 'KEYWORD_ARTICLES_FETCHED', message: 'Láº¥y danh sÃ¡ch bÃ i bÃ¡o theo keyword thÃ nh cÃ´ng', data: pageItems, pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) } };
 }
 
 async function legacyGlobalSearch(ctx) {
@@ -1568,8 +1538,8 @@ for (const entity of entities) {
 recordRoutes.push(
   { method: 'GET', path: '/author/leaderboard', handler: authorLeaderboard },
   { method: 'GET', path: '/author/:id/areas-breakdown', handler: authorAreasBreakdown },
-  { method: 'GET', path: '/catalog/subject-areas', handler: async ctx => ({ success: true, code: 'CATALOG_SUBJECT_AREA_LIST_SUCCESS', message: 'Lấy danh sách subject area thành công', data: await catalogSubjectAreas(ctx) }) },
-  { method: 'GET', path: '/catalog/subject-categories', handler: async ctx => ({ success: true, code: 'CATALOG_SUBJECT_CATEGORY_LIST_SUCCESS', message: 'Lấy danh sách subject category thành công', data: await catalogSubjectCategories(ctx) }) },
+  { method: 'GET', path: '/catalog/subject-areas', handler: async ctx => ({ success: true, code: 'CATALOG_SUBJECT_AREA_LIST_SUCCESS', message: 'Láº¥y danh sÃ¡ch subject area thÃ nh cÃ´ng', data: await catalogSubjectAreas(ctx) }) },
+  { method: 'GET', path: '/catalog/subject-categories', handler: async ctx => ({ success: true, code: 'CATALOG_SUBJECT_CATEGORY_LIST_SUCCESS', message: 'Láº¥y danh sÃ¡ch subject category thÃ nh cÃ´ng', data: await catalogSubjectCategories(ctx) }) },
   { method: 'GET', path: '/catalog/journals/:id/rankings', handler: catalogJournalRankings },
   { method: 'GET', path: '/catalog/volumes', handler: catalogVolumes },
   { method: 'GET', path: '/catalog/issues', handler: catalogIssues },
@@ -1643,7 +1613,7 @@ async function authorList(ctx, source) {
       subject_areas: areas, subject_area: areas[0] || null };
   });
   const page = paginate(rows, ctx.query, 10, 100);
-  return { success: true, code: 'AUTHOR_LIST_FETCHED', message: 'Láº¥y danh sÃ¡ch tÃ¡c giáº£ thÃ nh cÃ´ng', data: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, page.totalPages) } };
+  return { success: true, code: 'AUTHOR_LIST_FETCHED', message: 'LÃ¡ÂºÂ¥y danh sÃƒÂ¡ch tÃƒÂ¡c giÃ¡ÂºÂ£ thÃƒÂ nh cÃƒÂ´ng', data: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, page.totalPages) } };
 }
 
 async function authorArticles(ctx) {
@@ -1664,7 +1634,7 @@ async function authorArticles(ctx) {
         })) : [],
       author_ids: article.author_ids || [], author_names: article.author_names || [],
       primary_topic: article.primary_topic, created_at: article.created_at }));
-    return { success: true, code: 'AUTHOR_ARTICLES_FETCHED', message: 'Lấy bài viết của tác giả thành công',
+    return { success: true, code: 'AUTHOR_ARTICLES_FETCHED', message: 'Láº¥y bÃ i viáº¿t cá»§a tÃ¡c giáº£ thÃ nh cÃ´ng',
       pagination: { page: result.pagination.page, limit: result.pagination.limit, total: result.pagination.total, total_pages: Math.max(1, result.pagination.total_pages) }, data: rows };
   }
   const [links, articles] = await Promise.all([all(ctx.db, 'author_articles'), all(ctx.db, 'articles')]);
@@ -1678,7 +1648,7 @@ async function authorArticles(ctx) {
     return number(b.publication_year) - number(a.publication_year) || String(b.article_id).localeCompare(String(a.article_id), undefined, { numeric: true });
   });
   const start = (page - 1) * limit;
-  return { success: true, code: 'AUTHOR_ARTICLES_FETCHED', message: 'Láº¥y bÃ i viáº¿t cá»§a tÃ¡c giáº£ thÃ nh cÃ´ng', pagination: { page, limit, total: rows.length, total_pages: Math.max(1, Math.ceil(rows.length / limit)) }, data: rows.slice(start, start + limit) };
+  return { success: true, code: 'AUTHOR_ARTICLES_FETCHED', message: 'LÃ¡ÂºÂ¥y bÃƒÂ i viÃ¡ÂºÂ¿t cÃ¡Â»Â§a tÃƒÂ¡c giÃ¡ÂºÂ£ thÃƒÂ nh cÃƒÂ´ng', pagination: { page, limit, total: rows.length, total_pages: Math.max(1, Math.ceil(rows.length / limit)) }, data: rows.slice(start, start + limit) };
 }
 
 async function authorLeaderboard(ctx) {
@@ -1793,7 +1763,7 @@ async function authorLeaderboard(ctx) {
   });
   const page = paginate(rows, ctx.query, 10, 100);
   page.totalPages = Math.max(1, page.totalPages);
-  return { success: true, code: 'AUTHOR_LEADERBOARD_FETCHED', message: 'Lấy bảng xếp hạng tác giả thành công', pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: page.totalPages }, data: page.items };
+  return { success: true, code: 'AUTHOR_LEADERBOARD_FETCHED', message: 'Láº¥y báº£ng xáº¿p háº¡ng tÃ¡c giáº£ thÃ nh cÃ´ng', pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: page.totalPages }, data: page.items };
 }
 async function authorAreasBreakdown(ctx) {
   if (!/^\d+$/.test(String(ctx.params.id)) || BigInt(String(ctx.params.id)) < 1n) throw new HttpError(400, 'Invalid author ID', 'AUTHOR_INVALID_ID');
@@ -1823,7 +1793,7 @@ async function authorAreasBreakdown(ctx) {
   }
   const total = [...categoryArticles.values()].reduce((sum, ids) => sum + ids.size, 0);
   const breakdown = [...categoryArticles].map(([categoryId, ids]) => ({ subject_category_id: categoryId, category_name: categoryById.get(categoryId)?.display_name, article_count: ids.size, percentage: total ? Math.round(ids.size / total * 10000) / 100 : null })).sort((a, b) => b.article_count - a.article_count);
-  return { success: true, code: 'AREA_BREAKDOWN_FETCHED', message: 'Phân tích lĩnh vực nghiên cứu của tác giả thành công', data: { ...author, breakdown } };
+  return { success: true, code: 'AREA_BREAKDOWN_FETCHED', message: 'PhÃ¢n tÃ­ch lÄ©nh vá»±c nghiÃªn cá»©u cá»§a tÃ¡c giáº£ thÃ nh cÃ´ng', data: { ...author, breakdown } };
 }
 async function catalogSubjectAreas(ctx) {
   const rows = (await all(ctx.db, 'subjectAreas')).filter(row => !isDeleted(row));
@@ -1864,83 +1834,98 @@ const openAlexSourceWorks = (ctx, sourceId) => openAlexRequest(ctx, 'works', {
   filter: `primary_location.source.id:${sourceId}`, page: 1, per_page: 100,
   select: openAlexWorksSelect, sort: 'publication_date:desc',
 });
+async function openAlexSourceWorksSample(ctx, sourceId) {
+  const rows = [];
+  for (let page = 1; page <= 5; page += 1) {
+    const result = await openAlexRequest(ctx, 'works', { filter: `primary_location.source.id:${sourceId}`, page, per_page: 100, select: openAlexWorksSelect, sort: 'publication_date:desc' });
+    rows.push(...(result.results || []));
+    if (rows.length >= Number(result.meta?.count || 0) || !(result.results || []).length) break;
+  }
+  return { results: rows };
+}
 const openAlexVolumeId = (sourceId, volume) => `openalex:${sourceId}:volume:${encodeURIComponent(volume)}`;
 const openAlexIssueId = (sourceId, volume, issue) => `openalex:${sourceId}:issue:${encodeURIComponent(volume)}:${encodeURIComponent(issue)}`;
 async function catalogVolumes(ctx) {
-  const journalFilter = ctx.query.journal_id;
-  if (journalFilter !== undefined && (!/^\d+$/.test(String(journalFilter).trim()) || BigInt(String(journalFilter).trim()) <= 0n)) throw new HttpError(400, 'journal_id must be a positive integer', 'CATALOG_JOURNAL_ID_INVALID');
-  if (journalFilter !== undefined) {
-    const sourceId = /^S/i.test(String(journalFilter)) ? String(journalFilter).toUpperCase() : `S${journalFilter}`;
-    const result = await openAlexSourceWorks(ctx, sourceId);
-    const groups = new Map();
-    for (const work of result.results || []) {
-      const volume = String(work.biblio?.volume || '').trim();
-      if (!volume) continue;
-      const row = groups.get(volume) || { id: openAlexVolumeId(sourceId, volume), volume_id: openAlexVolumeId(sourceId, volume), journal_id: String(journalFilter), volume_number: volume, publication_year: work.publication_year ?? null, year: work.publication_year ?? null, issue_count: 0, article_count: 0, _issues: new Set() };
-      row.article_count += 1;
-      const issue = String(work.biblio?.issue || '').trim();
-      if (issue) row._issues.add(issue);
-      if (Number(work.publication_year) > Number(row.publication_year || 0)) row.publication_year = row.year = work.publication_year;
-      groups.set(volume, row);
-    }
-    if (!groups.size) {
-      for (const work of result.results || []) {
-        const year = work.publication_year ? String(work.publication_year) : 'unknown';
-        const key = `year:${year}`;
-        const row = groups.get(key) || { id: openAlexVolumeId(sourceId, key), volume_id: openAlexVolumeId(sourceId, key), journal_id: String(journalFilter), volume_number: '', display_label: year === 'unknown' ? 'Publications without volume metadata' : `Publications in ${year}`, publication_year: year === 'unknown' ? null : Number(year), year: year === 'unknown' ? null : Number(year), issue_count: 0, article_count: 0, can_expand: false, _issues: new Set() };
-        row.article_count += 1;
-        groups.set(key, row);
-      }
-    }
-    const rows = [...groups.values()].map(({ _issues, ...row }) => ({ ...row, issue_count: _issues.size }));
-    rows.sort((a, b) => number(b.publication_year) - number(a.publication_year) || String(b.volume_number).localeCompare(String(a.volume_number), undefined, { numeric: true }));
-    const page = paginate(rows, ctx.query, 10, 100);
-    return { success: true, code: 'CATALOG_VOLUME_LIST_SUCCESS', message: 'Volumes derived from OpenAlex works', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, Math.ceil(page.total / page.limit)) } } };
-  }  const [volumes, journals, issues, articles] = await Promise.all(['volumes', 'journals', 'issues', 'articles'].map(name => all(ctx.db, name)));
-  const journalById = new Map(journals.map(row => [String(row.journal_id || row.id), row]));
-  let rows = volumes.filter(row => row.is_deleted !== true && (journalFilter === undefined || String(row.journal_id) === String(journalFilter))).map(volume => {
-    const volumeId = String(volume.volume_id || volume.id);
-    const matchingIssues = issues.filter(issue => String(issue.volume_id || '') === volumeId && issue.is_deleted !== true);
-    const issueIds = new Set(matchingIssues.map(issue => String(issue.issue_id || issue.id)));
-    return { volume_id: volumeId, id: volumeId, journal_id: volume.journal_id == null ? null : String(volume.journal_id), journal_name: journalById.get(String(volume.journal_id || ''))?.display_name ?? null, volume_number: volume.volume_number, publication_year: volume.publication_year, year: volume.publication_year, issue_count: issueIds.size, article_count: new Set(articles.filter(article => article.is_deleted !== true && issueIds.has(String(article.issue_id || ''))).map(article => String(article.article_id || article.id))).size };
-  });
-  const descNullLast = (a, b) => a == null ? (b == null ? 0 : 1) : b == null ? -1 : number(b) - number(a);
-  rows.sort((a, b) => descNullLast(a.publication_year, b.publication_year) || descNullLast(a.volume_number, b.volume_number));
+  const journalFilter = String(ctx.query.journal_id || '').trim();
+  const sourceSuffix = journalFilter.replace(/^S/i, '');
+  if (!/^\d+$/.test(sourceSuffix) || BigInt(sourceSuffix) <= 0n) throw new HttpError(400, 'journal_id is required and must be an OpenAlex source ID or positive integer', 'CATALOG_JOURNAL_ID_INVALID');
+  const sourceId = `S${sourceSuffix}`;
+  const result = await openAlexSourceWorksSample(ctx, sourceId);
+  const groups = new Map();
+  for (const work of result.results || []) {
+    const volume = String(work.biblio?.volume || '').trim();
+    const issue = String(work.biblio?.issue || '').trim();
+    const key = volume || `year:${work.publication_year || 'unknown'}`;
+    const row = groups.get(key) || {
+      id: openAlexVolumeId(sourceId, key), volume_id: openAlexVolumeId(sourceId, key), journal_id: sourceSuffix,
+      volume_number: volume, display_label: volume ? null : `Publications in ${work.publication_year || 'unknown year'}`,
+      publication_year: work.publication_year ?? null, year: work.publication_year ?? null,
+      issue_count: 0, article_count: 0, can_expand: Boolean(volume), _issues: new Set(),
+    };
+    row.article_count += 1;
+    if (issue) row._issues.add(issue);
+    if (Number(work.publication_year) > Number(row.publication_year || 0)) row.publication_year = row.year = work.publication_year;
+    groups.set(key, row);
+  }
+  const rows = [...groups.values()].map(({ _issues, ...row }) => ({ ...row, issue_count: _issues.size }));
+  rows.sort((a, b) => number(b.publication_year) - number(a.publication_year) || String(b.volume_number).localeCompare(String(a.volume_number), undefined, { numeric: true }));
   const page = paginate(rows, ctx.query, 10, 100);
-  return { success: true, code: 'CATALOG_VOLUME_LIST_SUCCESS', message: 'Lấy danh sách volume thành công', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, Math.ceil(page.total / page.limit)) } } };
+  return { success: true, code: 'CATALOG_VOLUME_LIST_SUCCESS', message: 'Volumes derived from OpenAlex works', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, Math.ceil(page.total / page.limit)) } } };
 }
 async function catalogIssues(ctx) {
-  const volumeFilter = ctx.query.volume_id;
-  const openAlexVolumeMatch = String(volumeFilter || '').match(/^openalex:(S\w+):volume:(.+)$/i);
-  if (openAlexVolumeMatch) {
-    const [, sourceId, encodedVolume] = openAlexVolumeMatch;
-    const volume = decodeURIComponent(encodedVolume);
-    const result = await openAlexSourceWorks(ctx, sourceId.toUpperCase());
-    const groups = new Map();
-    for (const work of result.results || []) {
-      if (String(work.biblio?.volume || '').trim() !== volume) continue;
-      const issue = String(work.biblio?.issue || '').trim();
-      if (!issue) continue;
-      const row = groups.get(issue) || { id: openAlexIssueId(sourceId.toUpperCase(), volume, issue), issue_id: openAlexIssueId(sourceId.toUpperCase(), volume, issue), volume_id: volumeFilter, issue_number: issue, publication_year: work.publication_year ?? null, year: work.publication_year ?? null, article_count: 0 };
-      row.article_count += 1;
-      groups.set(issue, row);
-    }
-    const rows = [...groups.values()].sort((a, b) => number(b.publication_year) - number(a.publication_year) || String(b.issue_number).localeCompare(String(a.issue_number), undefined, { numeric: true }));
-    const page = paginate(rows, ctx.query, 10, 100);
-    return { success: true, code: 'CATALOG_ISSUE_LIST_SUCCESS', message: 'Issues derived from OpenAlex works', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, Math.ceil(page.total / page.limit)) } } };
+  const volumeFilter = String(ctx.query.volume_id || '').trim();
+  const volumeMatch = volumeFilter.match(/^openalex:(S\d+):volume:(.+)$/i);
+  const journalFilter = String(ctx.query.journal_id || '').trim();
+  const sourceSuffix = volumeMatch ? volumeMatch[1].slice(1) : journalFilter.replace(/^S/i, '');
+  if (!/^\d+$/.test(sourceSuffix) || BigInt(sourceSuffix) <= 0n || (!volumeMatch && !journalFilter)) {
+    throw new HttpError(400, 'Provide an OpenAlex volume_id or journal_id to list issues', 'CATALOG_ISSUE_SCOPE_REQUIRED');
   }
-  if (volumeFilter !== undefined && (!/^\d+$/.test(String(volumeFilter).trim()) || BigInt(String(volumeFilter).trim()) <= 0n)) throw new HttpError(400, 'volume_id must be a positive integer', 'CATALOG_VOLUME_ID_INVALID');
-  const [issues, articles] = await Promise.all([all(ctx.db, 'issues'), all(ctx.db, 'articles')]);
-  let rows = issues.filter(row => row.is_deleted !== true && (volumeFilter === undefined || String(row.volume_id) === String(volumeFilter))).map(issue => {
-    const issueId = String(issue.issue_id || issue.id);
-    return { issue_id: issueId, id: issueId, volume_id: issue.volume_id == null ? null : String(issue.volume_id), issue_number: issue.issue_number, publication_year: issue.publication_year, year: issue.publication_year, article_count: new Set(articles.filter(article => String(article.issue_id || '') === issueId).map(article => String(article.article_id || article.id))).size };
-  });
-  const descNullLast = (a, b) => a == null ? (b == null ? 0 : 1) : b == null ? -1 : number(b) - number(a);
-  rows.sort((a, b) => descNullLast(a.publication_year, b.publication_year) || descNullLast(a.issue_number, b.issue_number));
+  const sourceId = `S${sourceSuffix}`;
+  let requestedVolume = null;
+  if (volumeMatch) {
+    try { requestedVolume = decodeURIComponent(volumeMatch[2]); }
+    catch { throw new HttpError(400, 'Invalid OpenAlex volume_id', 'CATALOG_VOLUME_ID_INVALID'); }
+  }
+  const result = await openAlexSourceWorksSample(ctx, sourceId);
+  const groups = new Map();
+  for (const work of result.results || []) {
+    const volume = String(work.biblio?.volume || '').trim();
+    const issue = String(work.biblio?.issue || '').trim();
+    if (!volume || !issue || (requestedVolume !== null && volume !== requestedVolume)) continue;
+    const key = `${volume}:${issue}`;
+    const row = groups.get(key) || {
+      id: openAlexIssueId(sourceId, volume, issue), issue_id: openAlexIssueId(sourceId, volume, issue),
+      volume_id: openAlexVolumeId(sourceId, volume), journal_id: sourceSuffix, volume_number: volume,
+      issue_number: issue, publication_year: work.publication_year ?? null, year: work.publication_year ?? null, article_count: 0,
+    };
+    row.article_count += 1;
+    if (Number(work.publication_year) > Number(row.publication_year || 0)) row.publication_year = row.year = work.publication_year;
+    groups.set(key, row);
+  }
+  const rows = [...groups.values()].sort((a, b) => number(b.publication_year) - number(a.publication_year) || String(b.issue_number).localeCompare(String(a.issue_number), undefined, { numeric: true }));
   const page = paginate(rows, ctx.query, 10, 100);
-  return { success: true, code: 'CATALOG_ISSUE_LIST_SUCCESS', message: 'Lấy danh sách issue thành công', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, Math.ceil(page.total / page.limit)) } } };
+  return { success: true, code: 'CATALOG_ISSUE_LIST_SUCCESS', message: 'Issues derived from OpenAlex works', data: { items: page.items, pagination: { page: page.page, limit: page.limit, total: page.total, total_pages: Math.max(1, Math.ceil(page.total / page.limit)) } } };
 }
-
+async function getOpenAlexVolumeIssue(ctx, name) {
+  const value = String(ctx.params.id || '');
+  const match = name === 'volumes'
+    ? value.match(/^openalex:(S\d+):volume:(.+)$/i)
+    : value.match(/^openalex:(S\d+):issue:(.*):([^:]+)$/i);
+  if (!match) throw new HttpError(404, `${name === 'volumes' ? 'Volume' : 'Issue'} not found in OpenAlex`, name === 'volumes' ? 'VOLUME_NOT_FOUND' : 'ISSUE_NOT_FOUND');
+  if (name === 'volumes') {
+    const result = await catalogVolumes({ ...ctx, query: { ...ctx.query, journal_id: match[1].slice(1), page: 1, limit: 100 } });
+    const row = result.data.items.find(item => item.volume_id === value);
+    if (!row) throw new HttpError(404, 'Volume not found in OpenAlex', 'VOLUME_NOT_FOUND');
+    return { success: true, code: 'GET_VOLUME_DETAIL_SUCCESS', data: row };
+  }
+  let volume; let issue;
+  try { volume = decodeURIComponent(match[2]); issue = decodeURIComponent(match[3]); }
+  catch { throw new HttpError(400, 'Invalid OpenAlex issue_id', 'CATALOG_ISSUE_ID_INVALID'); }
+  const result = await openAlexSourceWorksSample(ctx, match[1].toUpperCase());
+  const works = (result.results || []).filter(work => String(work.biblio?.volume || '').trim() === volume && String(work.biblio?.issue || '').trim() === issue);
+  if (!works.length) throw new HttpError(404, 'Issue not found in OpenAlex', 'ISSUE_NOT_FOUND');
+  return { success: true, code: 'GET_ISSUE_DETAIL_SUCCESS', data: { issue_id: value, volume_id: openAlexVolumeId(match[1].toUpperCase(), volume), journal_id: match[1].slice(1), issue_number: issue, volume_number: volume, publication_year: Math.max(...works.map(work => Number(work.publication_year) || 0)) || null, article_count: works.length } };
+}
 async function zoneStats(ctx, level, code) {
   if (level === 'region' && ctx.path.includes('/countries/') && (!code || !String(code).trim())) throw new HttpError(400, 'Country code is required', 'COUNTRY_REGIONS_STATS_ERROR');
   code = code ? String(code).trim() : undefined;
@@ -1982,7 +1967,7 @@ async function zoneStats(ctx, level, code) {
     const rows = zones.filter(row => String(row.type).toUpperCase() === 'COUNTRY').map(zone => ({ ...zoneFields(zone), article_count: articleCount(zone, 'country', { activeOnly: true, year }) }));
     rows.sort((a, b) => b.article_count - a.article_count || String(a.name).localeCompare(String(b.name)));
     const items = rows.slice((page - 1) * limit, page * limit);
-    return { success: true, code: 'GET_COUNTRY_STATS_SUCCESS', message: 'Lấy danh sách thống kê quốc gia thành công', data: items, pagination: { total: rows.length, page, limit, totalPages: Math.ceil(rows.length / limit) } };
+    return { success: true, code: 'GET_COUNTRY_STATS_SUCCESS', message: 'Láº¥y danh sÃ¡ch thá»‘ng kÃª quá»‘c gia thÃ nh cÃ´ng', data: items, pagination: { total: rows.length, page, limit, totalPages: Math.ceil(rows.length / limit) } };
   }
   const country = code ? zones.find(row => String(row.type).toUpperCase() === 'COUNTRY' && [row.code, row.iso_code].some(value => String(value || '').toUpperCase() === String(code).toUpperCase())) : null;
   if (code && !country) throw new HttpError(404, `Country '${code}' not found`, 'COUNTRY_NOT_FOUND');
@@ -1993,6 +1978,6 @@ async function zoneStats(ctx, level, code) {
         && issues.some(issue => String(issue.volume_id || '') === volumeId(volume))));
   }).map(zone => ({ ...zoneFields(zone), article_count: articleCount(zone, 'region') }));
   rows.sort((a, b) => b.article_count - a.article_count || String(a.name).localeCompare(String(b.name)));
-  if (level === 'region' && ctx.path.includes('/countries/')) return { success: true, code: 'GET_COUNTRY_REGIONS_STATS_SUCCESS', message: 'Lấy thống kê region theo quốc gia thành công', data: { country: zoneFields(country), regions: rows } };
-  return { success: true, code: 'GET_REGION_STATS_SUCCESS', message: code ? `Lấy danh sách phân vùng của quốc gia '${code}' thành công` : 'Lấy danh sách phân vùng toàn cầu thành công', data: rows };
+  if (level === 'region' && ctx.path.includes('/countries/')) return { success: true, code: 'GET_COUNTRY_REGIONS_STATS_SUCCESS', message: 'Láº¥y thá»‘ng kÃª region theo quá»‘c gia thÃ nh cÃ´ng', data: { country: zoneFields(country), regions: rows } };
+  return { success: true, code: 'GET_REGION_STATS_SUCCESS', message: code ? `Láº¥y danh sÃ¡ch phÃ¢n vÃ¹ng cá»§a quá»‘c gia '${code}' thÃ nh cÃ´ng` : 'Láº¥y danh sÃ¡ch phÃ¢n vÃ¹ng toÃ n cáº§u thÃ nh cÃ´ng', data: rows };
 }

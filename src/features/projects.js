@@ -264,23 +264,6 @@ async function projectKeywordIds(ctx, projectId) {
   return [...new Set(rows.map(row => String(row.keyword_id || row.keyword || '').trim()).filter(Boolean))].slice(0, 100);
 }
 
-async function projectOpenAlexArticles(db, projectId, keywordIds) {
-  const links = [];
-  let offset = 0;
-  while (true) {
-    const page = await db.query('openalex_project_works', { filters: [{ field: 'project_id', value: String(projectId) }], limit: 1000, offset });
-    links.push(...page);
-    if (page.length < 1000) break;
-    offset += page.length;
-  }
-  const watchedIds = new Set(keywordIds.map(normalizeOpenAlexKeywordId));
-  const workIds = [...new Set(links.filter(row => watchedIds.has(normalizeOpenAlexKeywordId(row.keyword_id))).map(row => String(row.work_id || '')).filter(Boolean))];
-  const documents = await Promise.all(workIds.map(workId => db.get('openalex_works', workId)));
-  const articles = documents.filter(row => row?.data).map(row => openAlexWorkToLegacy(row.data));
-  articles.sort((a, b) => Number(b.publication_year || 0) - Number(a.publication_year || 0) || String(b.publication_date || '').localeCompare(String(a.publication_date || '')));
-  return articles;
-}
-
 async function projectScopedArticles(ctx, project) {
   const projectId = String(project.project_id || project.id);
   const [journalLinks, categoryLinks, articleScopes] = await Promise.all([
@@ -354,14 +337,21 @@ async function listProjectKeywords(ctx) {
 async function watchKeywords(ctx, replace = false) {
   await requireProject(ctx, ctx.params.projectId);
   const requestedValues = Array.isArray(ctx.body.keyword_ids) ? [...new Set(ctx.body.keyword_ids.map(String))] : [];
-  const keywordRows = await all(ctx.db, 'keywords');
-  const localKeywords = new Map(keywordRows.map(row => [normalizeOpenAlexKeywordId(row.keyword_id || row.id), row]));
   const resolvedKeywords = await Promise.all(requestedValues.map(async keywordId => {
     const normalizedId = normalizeOpenAlexKeywordId(keywordId);
-    const local = localKeywords.get(normalizedId);
-    if (local) return { keywordId: normalizedId, normalizedId, keyword: local };
-    const cached = await ctx.db.get('openalex_keywords', normalizedId) || await ctx.db.get('openalex_keywords', normalizedId.toUpperCase());
-    return cached?.data ? { keywordId: normalizedId, normalizedId, keyword: cached.data } : null;
+    try {
+      if (normalizedId.startsWith('TEXT_')) {
+        const search = normalizedId.slice(5).replace(/_/g, ' ').trim();
+        const result = await openAlexRequest(ctx, 'keywords', { search, per_page: 1, select: 'id,display_name,works_count,cited_by_count' });
+        const keyword = result.results?.[0];
+        return keyword ? { keywordId: normalizeOpenAlexKeywordId(keyword.id), normalizedId: normalizeOpenAlexKeywordId(keyword.id), keyword } : null;
+      }
+      const keyword = await openAlexRequest(ctx, `keywords/${normalizedId}`, { select: 'id,display_name,works_count,cited_by_count' });
+      return keyword?.id ? { keywordId: normalizeOpenAlexKeywordId(keyword.id), normalizedId, keyword } : null;
+    } catch (error) {
+      if (error?.details?.upstream_status === 404) return null;
+      throw error;
+    }
   }));
   const validKeywords = resolvedKeywords.filter(Boolean);
   const values = [...new Set(validKeywords.map(row => row.keywordId))];
@@ -463,12 +453,12 @@ export const projectRoutes = defineRoutes([
     await requireProject(ctx, ctx.params.projectId);
     const keywordIds = await projectKeywordIds(ctx, ctx.params.projectId);
     const result = await enqueueProjectKeywordSyncs(ctx.env, ctx.db, ctx.params.projectId, keywordIds);
-    return { body: { success: true, data: { ...result, sync: await projectOpenAlexSyncStatus(ctx.db, ctx.params.projectId, keywordIds) } }, status: 202 };
+    return { body: { success: true, data: { ...result, sync: await projectOpenAlexSyncStatus(ctx.env, ctx.params.projectId, keywordIds) } }, status: 202 };
   } },
   { method: 'GET', path: '/projects/:projectId/openalex-sync', auth: true, handler: async ctx => {
     await requireProject(ctx, ctx.params.projectId);
     const keywordIds = await projectKeywordIds(ctx, ctx.params.projectId);
-    return ok(await projectOpenAlexSyncStatus(ctx.db, ctx.params.projectId, keywordIds), 'OpenAlex project sync status fetched');
+    return ok(await projectOpenAlexSyncStatus(ctx.env, ctx.params.projectId, keywordIds), 'OpenAlex project sync status fetched');
   } },
   { method: 'GET', path: '/projects/:id/overview', auth: true, handler: projectOverview },
   { method: 'GET', path: '/projects/:id/analytics', auth: true, handler: projectAnalytics },

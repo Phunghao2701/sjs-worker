@@ -2,7 +2,7 @@ import { HttpError } from '../core/http.js';
 import { defineRoutes, ok } from '../core/router.js';
 import { all, byId, find, hydrateArticles, id, isDeleted, matchText, nowIso, paginate, requireFound } from '../firestore/repository.js';
 import { requireProject } from './projects.js';
-import { openAlexWorkToLegacy, searchOpenAlexEntities, searchOpenAlexWorkGraph } from '../openalex/adapters.js';
+import { getOpenAlexSourcesByIds, getOpenAlexWorksByIds, openAlexWorkToLegacy, searchOpenAlexEntities, searchOpenAlexWorkGraph } from '../openalex/adapters.js';
 import { openAlexRequest } from '../openalex/client.js';
 import { loadProjectResearchScopes, openAlexPublicationTrends, openAlexTrendingKeywords } from '../openalex/project-dashboard.js';
 import { normalizeOpenAlexKeywordId } from '../openalex/project-sync.js';
@@ -799,119 +799,35 @@ async function geoDistributionData(ctx) {
 }
 
 async function sourceJournalArticles(ctx, mode) {
-  const { db, query } = ctx;
-  const projectId = String(query.project_id || '');
+  const projectId = String(ctx.query.project_id || '');
   const hasProject = Boolean(projectId && !['undefined', 'null'].includes(projectId));
-  const areaValue = String(query.subject_area || '').trim();
-  const categoryValue = String(query.subject_category || query.keywords || '').trim();
-  const areaActive = areaValue && !['all', 'all areas', 'all domains'].includes(areaValue.toLowerCase());
-  const categoryActive = categoryValue && !['all', 'all categories', 'all domains'].includes(categoryValue.toLowerCase());
-  const [rawArticles, areas, categories, topics, subTopics] = await Promise.all([
-    all(db, 'articles'), all(db, 'subjectAreas'), all(db, 'subjectCategories'), all(db, 'topics'), all(db, 'sub_topics'),
-  ]);
-  let mappedDomain = 'all';
-  let projectCategoryIds = [];
-  let projectScopeIds = null;
-
+  let works;
   if (hasProject) {
-    const project = await requireProject(ctx, projectId);
-    const projectArea = projectAreaFor(project, areas);
-    if (projectArea && isDeleted(projectArea)) throw new HttpError(404, 'Project subject area not found', 'NOT_FOUND');
-    if (projectArea) {
-      mappedDomain = String(projectArea.display_name || projectArea.name || 'all');
-      const projectAreaId = String(projectArea.subject_area_id || projectArea.id);
-      projectCategoryIds = categories.filter(row => !isDeleted(row) && String(row.subject_area_id || '') === projectAreaId)
-        .map(row => String(row.subject_category_id || row.id));
+    works = await collaborationScopedArticles(ctx);
+  } else {
+    const filters = [];
+    const fromYear = ctx.query.from_year ? Number(ctx.query.from_year) : null;
+    const toYear = ctx.query.to_year ? Number(ctx.query.to_year) : null;
+    if (fromYear) filters.push(`from_publication_date:${fromYear}-01-01`);
+    if (toYear) filters.push(`to_publication_date:${toYear}-12-31`);
+    const select = 'id,display_name,publication_year,publication_date,cited_by_count,primary_location,authorships,primary_topic,topics,keywords,biblio';
+    const rows = [];
+    for (let page = 1; page <= 5; page += 1) {
+      const result = await openAlexRequest(ctx, 'works', {
+        ...(filters.length ? { filter: filters.join(',') } : {}), page, per_page: 100,
+        select, sort: mode === 'impact' ? 'cited_by_count:desc' : 'publication_date:desc',
+      });
+      rows.push(...(result.results || []));
+      if (rows.length >= Number(result.meta?.count || 0)) break;
     }
-    const scopeLinks = await find(db, 'project_article_scopes', row => String(row.project_id) === projectId, { limit: Infinity });
-    projectScopeIds = new Set(scopeLinks.map(row => String(row.article_id)));
-  } else if (areaActive) {
-    const area = areas.find(row => !isDeleted(row) && (String(row.subject_area_id || row.id) === areaValue
-      || String(row.display_name || '').toLowerCase() === areaValue.toLowerCase()));
-    if (area) mappedDomain = String(area.display_name || area.name || 'all');
+    works = rows.map(openAlexWorkToLegacy);
   }
-
-  if (categoryActive) {
-    const category = categories.find(row => !isDeleted(row) && (String(row.subject_category_id || row.id) === categoryValue
-      || String(row.display_name || '').toLowerCase() === categoryValue.toLowerCase()));
-    if (category) {
-      const parent = areas.find(row => String(row.subject_area_id || row.id) === String(category.subject_area_id || ''));
-      if (hasProject) projectCategoryIds = [String(category.subject_category_id || category.id)];
-      if (parent) mappedDomain = String(parent.display_name || parent.name || mappedDomain);
-    } else if (hasProject) projectCategoryIds = [];
-  } else if (areaActive) {
-    const area = areas.find(row => !isDeleted(row) && (String(row.subject_area_id || row.id) === areaValue
-      || String(row.display_name || '').toLowerCase() === areaValue.toLowerCase()));
-    if (area) {
-      const areaId = String(area.subject_area_id || area.id);
-      if (hasProject) projectCategoryIds = categories.filter(row => !isDeleted(row) && String(row.subject_area_id || '') === areaId)
-        .map(row => String(row.subject_category_id || row.id));
-      mappedDomain = String(area.display_name || area.name || mappedDomain);
-    } else if (hasProject) projectCategoryIds = [];
-  }
-
-  const topicIds = new Set();
-  if (mode === 'quartiles' && hasProject && projectCategoryIds.length) {
-    for (const topic of topics) if (projectCategoryIds.includes(String(topic.subject_category_id))) topicIds.add(String(topic.topic_id || topic.id));
-  } else if (mappedDomain && mappedDomain.toLowerCase() !== 'all') {
-    const areaIds = new Set(areas.filter(row => String(row.display_name || '').toLowerCase() === mappedDomain.toLowerCase())
-      .map(row => String(row.subject_area_id || row.id)));
-    const domainCategoryIds = new Set(categories.filter(row => areaIds.has(String(row.subject_area_id || '')))
-      .map(row => String(row.subject_category_id || row.id)));
-    for (const topic of topics) if (domainCategoryIds.has(String(topic.subject_category_id))) topicIds.add(String(topic.topic_id || topic.id));
-  }
-
-  let projectOpenAlexArticles = [];
-  if (hasProject) {
-    const keywordRows = await find(db, 'project_keywords', row => String(row.project_id) === projectId, { limit: Infinity });
-    const keywordIds = new Set(keywordRows.map(row => normalizeOpenAlexKeywordId(row.keyword_id || row.keyword)).filter(Boolean));
-    const linkedWorks = [];
-    let offset = 0;
-    while (true) {
-      const page = await db.query('openalex_project_works', { filters: [{ field: 'project_id', value: projectId }], limit: 1000, offset });
-      linkedWorks.push(...page.filter(row => !keywordIds.size || keywordIds.has(normalizeOpenAlexKeywordId(row.keyword_id))));
-      if (page.length < 1000) break;
-      offset += page.length;
-    }
-    const cachedWorks = await db.batchGet('openalex_works', linkedWorks.map(row => row.work_id));
-    const cachedById = new Map(cachedWorks.map(row => [String(row.id || row.openalex_id || '').toUpperCase(), row.data || row]));
-    projectOpenAlexArticles = linkedWorks.map(link => {
-      const cached = cachedById.get(String(link.work_id || '').toUpperCase());
-      const work = cached ? openAlexWorkToLegacy(cached) : null;
-      if (!work && !link.journal_id) return null;
-      return { ...(work || {}), article_id: work?.article_id || link.work_id, openalex_id: work?.openalex_id || link.work_id,
-        publication_year: work?.publication_year || link.publication_year, citation_count: work?.citation_count ?? link.cited_by_count ?? 0,
-        journal_id: work?.journal_id || link.journal_id, journal_source_id: work?.journal_source_id || link.journal_source_id,
-        journal_name: work?.journal_name || link.journal_name, journal_issn: work?.journal_issn || link.journal_issn,
-        primary_topic: work?.primary_topic || link.primary_topic, is_deleted: false };
-    }).filter(Boolean);
-  }
-  const uniqueArticles = new Map();
-  for (const row of [...rawArticles.filter(row => !isDeleted(row)), ...projectOpenAlexArticles]) uniqueArticles.set(String(row.article_id || row.id || row.openalex_id), row);
-  let rows = [...uniqueArticles.values()];
-  const openAlexWorkIds = new Set(projectOpenAlexArticles.map(row => String(row.article_id || row.id)));
-  if (hasProject && ['ranking', 'quartiles', 'impact'].includes(mode)) {
-    rows = rows.filter(row => projectScopeIds.has(String(row.article_id || row.id)) || openAlexWorkIds.has(String(row.article_id || row.id)));
-  }
-  const hasFromYear = Boolean(query.from_year);
-  const hasToYear = Boolean(query.to_year);
-  const fromYear = hasFromYear ? Number(query.from_year) : null;
-  const toYear = hasToYear ? Number(query.to_year) : null;
-  if (mode === 'quartiles' && topicIds.size) {
-    const topicArticleIds = new Set();
-    for (const article of rows) {
-      if (topicIds.has(String(article.primary_topic || ''))) topicArticleIds.add(String(article.article_id || article.id));
-    }
-    for (const link of subTopics) if (topicIds.has(String(link.topic_id))) topicArticleIds.add(String(link.article_id));
-    rows = rows.filter(row => topicArticleIds.has(String(row.article_id || row.id)));
-  } else if (mappedDomain && mappedDomain.toLowerCase() !== 'all' && !hasProject) {
-    rows = [];
-  }
-  if (mode === 'ranking') {
-    if (hasFromYear) rows = rows.filter(row => row.publication_year != null && Number(row.publication_year) >= fromYear);
-    if (hasToYear) rows = rows.filter(row => row.publication_year != null && Number(row.publication_year) <= toYear);
-  }
-  return rows;
+  const fromYear = ctx.query.from_year ? Number(ctx.query.from_year) : null;
+  const toYear = ctx.query.to_year ? Number(ctx.query.to_year) : null;
+  return works.filter(work => {
+    const year = Number(work.publication_year || 0);
+    return (!fromYear || year >= fromYear) && (!toYear || year <= toYear);
+  });
 }
 
 async function journalRankingsForJournals(db, journalIds) {
@@ -951,15 +867,11 @@ async function journalAnalyticsData(ctx, articles, journals, mode) {
     const to = ctx.query.to_year ? Number(ctx.query.to_year) : null;
     if (from && to && from > to) throw new HttpError(400, 'Invalid year range: from_year cannot be greater than to_year', 'VALIDATION_ERROR');
   }
-  const [metricRows, issues, volumes, publishers] = await Promise.all([
-    all(ctx.db, 'ranking_metrics'), all(ctx.db, 'issues'), all(ctx.db, 'volumes'), all(ctx.db, 'publishers'),
-  ]);
-  const hasProject = Boolean(ctx.query.project_id && !['undefined', 'null'].includes(String(ctx.query.project_id)));
-  let scopedArticles = hasProject
-    ? mode === 'quartiles'
-      ? await collaborationScopedArticles(ctx)
-      : await sourceJournalArticles(ctx, mode === 'impact' ? 'impact' : mode)
-    : articles;
+  const metricRows = await all(ctx.db, 'ranking_metrics');
+  const issues = [];
+  const volumes = [];
+  const publishers = [];
+  const scopedArticles = articles;
 
   const metricById = new Map(metricRows.map(row => [String(row.metric_id || row.id), row]));
   const issueById = new Map(issues.map(row => [String(row.issue_id || row.id), row]));
@@ -1284,9 +1196,9 @@ async function analytics(ctx) {
   }
   if (endpoint === 'geo-distribution') return response(await geoDistributionData(ctx), 'Fetch geographical metrics successfully');
   if (endpoint === 'frontier') return response(await frontierTopics(ctx), 'Fetch frontier topics successfully');
-  if (endpoint === 'journals/impact-matrix') return response(await journalAnalyticsData(ctx, [], await all(ctx.db, 'journals'), 'impact'), 'Fetch impact matrix data successfully');
-  if (endpoint === 'journals/ranking') return response(await journalAnalyticsData(ctx, [], await all(ctx.db, 'journals'), 'ranking'), 'Fetch journal rankings successfully');
-  if (endpoint === 'journals/quartiles') return response(await journalAnalyticsData(ctx, [], await all(ctx.db, 'journals'), 'quartiles'), 'Fetch quartile distribution successfully');
+  if (endpoint === 'journals/impact-matrix') return response(await journalAnalyticsData(ctx, await sourceJournalArticles(ctx, 'impact'), [], 'impact'), 'Fetch impact matrix data successfully');
+  if (endpoint === 'journals/ranking') return response(await journalAnalyticsData(ctx, await sourceJournalArticles(ctx, 'ranking'), [], 'ranking'), 'Fetch journal rankings successfully');
+  if (endpoint === 'journals/quartiles') return response(await journalAnalyticsData(ctx, await sourceJournalArticles(ctx, 'quartiles'), [], 'quartiles'), 'Fetch quartile distribution successfully');
   if (endpoint === 'network/collaboration-dashboard') {
     const scopedArticles = await collaborationScopedArticles(ctx);
     const [rankings, impactMatrix, keyInsights, globalNetwork, authorTopicIntensity, institutionTopicIntensity] = await Promise.all([
@@ -2570,17 +2482,15 @@ async function sourceJournalMigration(ctx) {
   const query = ctx.query;
   const hasProject = Boolean(query.project_id && !['undefined', 'null'].includes(String(query.project_id)));
   if (hasProject) {
-    const [projectArticles, sources, journalRows] = await Promise.all([
-      sourceJournalArticles(ctx, 'ranking'), all(ctx.db, 'openalex_sources'), all(ctx.db, 'journals'),
-    ]);
-    const sourceById = new Map(sources.flatMap(row => [[String(row.id || ''), row], [String(row.openalex_id || ''), row]]).filter(([id]) => id));
-    const journalById = new Map(journalRows.map(row => [String(row.journal_id || row.id || ''), row]));
+    const projectArticles = await sourceJournalArticles(ctx, 'ranking');
+    const sources = await getOpenAlexSourcesByIds(ctx, projectArticles.map(article => article.journal_source_id || article.journal_openalex_id));
+    const sourceById = new Map(sources.map(row => [String(row.id || '').split('/').pop(), row]));
     const accessByJournal = new Map();
     for (const article of projectArticles) {
       const id = String(article.journal_source_id || article.journal_id || '');
       if (!id) continue;
-      const source = sourceById.get(id) || journalById.get(id);
-      const access = source?.is_oa ?? source?.is_open_access;
+      const source = sourceById.get(id.split('/').pop());
+      const access = source?.is_oa;
       if (typeof access === 'boolean') accessByJournal.set(id, access);
     }
     const includeLegacy = query.include_legacy === undefined || !['false', '0'].includes(String(query.include_legacy).toLowerCase());
@@ -3088,17 +2998,18 @@ async function trackedJournals(ctx) {
   const projectId = String(ctx.query.project_id || '');
   if (!projectId) throw new HttpError(400, 'project_id is required', 'VALIDATION_ERROR');
   await requireProject(ctx, projectId);
-  const [works, sources, metricRows] = await Promise.all([
+  const [works, metricRows] = await Promise.all([
     collaborationScopedArticles({ ...ctx, query: { ...ctx.query, project_id: projectId } }, { summary: true }),
-    all(ctx.db, 'openalex_sources'), all(ctx.db, 'ranking_metrics'),
+    all(ctx.db, 'ranking_metrics'),
   ]);
   const normalizeIssn = value => String(value || '').replace(/[^0-9X]/gi, '').toUpperCase();
-  const sourceById = new Map(sources.flatMap(row => [[String(row.id || ''), row.data || row], [String(row.openalex_id || ''), row.data || row]]).filter(([key]) => key));
+  const sources = await getOpenAlexSourcesByIds(ctx, works.map(work => work.journal_openalex_id || work.journal_source_id || work.journal_id));
+  const sourceById = new Map(sources.map(row => [String(row.id || '').split('/').pop(), row]));
   const journalCounts = new Map();
   for (const work of works) {
     const sourceId = String(work.journal_openalex_id || work.journal_source_id || work.journal_id || '');
     if (!sourceId) continue;
-    const source = sourceById.get(sourceId) || {};
+    const source = sourceById.get(sourceId.split('/').pop()) || {};
     const issn = normalizeIssn(work.journal_issn || source.issn_l || source.issn?.[0]);
     const key = issn || sourceId;
     const journal = journalCounts.get(key) || {

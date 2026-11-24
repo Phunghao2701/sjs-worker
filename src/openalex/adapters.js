@@ -104,6 +104,32 @@ export function openAlexWorkToLegacy(work) {
   };
 }
 
+export async function getOpenAlexWorksByIds(ctx, values) {
+  const ids = [...new Set((values || []).map(value => String(value || '').trim().replace(/^https?:\/\/openalex\.org\//i, '').replace(/\/+$/, '').split('/').pop().toUpperCase()).filter(value => /^W\d+$/.test(value)))];
+  const works = [];
+  for (let offset = 0; offset < ids.length; offset += 50) {
+    const batch = ids.slice(offset, offset + 50);
+    const result = await openAlexRequest(ctx, 'works', {
+      filter: `ids.openalex:${batch.join('|')}`,
+      per_page: batch.length,
+      select: entityConfig.articles.select,
+    });
+    works.push(...(result.results || []));
+  }
+  return works;
+}
+
+export async function getOpenAlexSourcesByIds(ctx, values) {
+  const ids = [...new Set((values || []).map(value => String(value || '').trim().replace(/^https?:\/\/openalex\.org\//i, '').replace(/\/+$/, '').split('/').pop().toUpperCase()).filter(value => /^S\d+$/.test(value)))];
+  const sources = [];
+  for (let offset = 0; offset < ids.length; offset += 50) {
+    const batch = ids.slice(offset, offset + 50);
+    const result = await openAlexRequest(ctx, 'sources', { filter: `ids.openalex:${batch.join('|')}`, per_page: batch.length, select: entityConfig.journals.select });
+    sources.push(...(result.results || []));
+  }
+  return sources;
+}
+
 function toLegacyEntity(kind, item) {
   const id = numericSuffix(item.id) ?? openAlexId(item.id);
   const common = { openalex_id: openAlexId(item.id), openalex_url: item.id || null, updated_date: item.updated_date || null, is_deleted: false };

@@ -1,4 +1,5 @@
 import { openAlexRequest } from './client.js';
+import { appGet, appMerge, appSet } from '../firestore/app-d1.js';
 
 const WORK_SELECT = [
   'id', 'doi', 'display_name', 'publication_year', 'publication_date', 'type', 'authorships',
@@ -8,10 +9,6 @@ const WORK_SELECT = [
 ].join(',');
 
 const cleanId = value => String(value || '').trim().replace(/^https?:\/\/openalex\.org\//i, '').toUpperCase();
-const sourceNumericId = value => {
-  const match = String(value || '').match(/(?:^|\/)S(\d+)$/i);
-  return match ? Number(match[1]) : null;
-};
 export const normalizeOpenAlexKeywordId = value => {
   const raw = String(value || '').trim().replace(/^https?:\/\/openalex\.org\//i, '').replace(/\/+$/, '').split('/').pop().trim();
   if (/^TEXT_/i.test(raw)) {
@@ -49,8 +46,8 @@ export async function enqueueProjectKeywordSyncs(env, db, projectId, keywordIds)
   if (!queue) {
     for (const keywordId of keywordKeys) {
       const key = stateId(projectId, keywordId);
-      const previous = await db.get('openalex_project_sync', key);
-      await db.set('openalex_project_sync', key, {
+      const previous = await appGet(env, 'openalex_project_sync', key);
+      await appSet(env, 'openalex_project_sync', key, {
         ...(previous || {}), project_id: String(projectId), keyword_id: keywordId,
         ...(keywordMap.get(keywordId) ? { keyword_term: keywordMap.get(keywordId) } : {}),
         status: 'ERROR', error: 'OpenAlex sync queue is not configured', failed_at: new Date().toISOString(),
@@ -62,7 +59,7 @@ export async function enqueueProjectKeywordSyncs(env, db, projectId, keywordIds)
   for (const keywordId of keywordKeys) {
     const key = stateId(projectId, keywordId);
     const keywordTerm = keywordMap.get(keywordId);
-    const previous = await db.get('openalex_project_sync', key);
+    const previous = await appGet(env, 'openalex_project_sync', key);
     if (previous?.status === 'PENDING' || previous?.status === 'PROCESSING') continue;
     const mode = previous?.initial_sync_complete ? 'incremental' : 'initial';
     const throughDate = dateOnly(new Date());
@@ -72,7 +69,7 @@ export async function enqueueProjectKeywordSyncs(env, db, projectId, keywordIds)
       mode, cursor: '*', through_date: throughDate,
       ...(mode === 'incremental' ? { from_date: previous.last_synced_date || throughDate } : {}),
     };
-    await db.set('openalex_project_sync', key, {
+    await appSet(env, 'openalex_project_sync', key, {
       ...(previous || {}), project_id: String(projectId), keyword_id: keywordId,
       ...(keywordTerm ? { keyword_term: keywordTerm } : {}),
       status: 'PENDING', mode, progress: 0, error: null, error_code: null, retryable: true, queued_at: new Date().toISOString(),
@@ -81,7 +78,7 @@ export async function enqueueProjectKeywordSyncs(env, db, projectId, keywordIds)
       await queue.send({ type: 'openalex-project-sync', ...job });
       queued += 1;
     } catch (error) {
-      await db.merge('openalex_project_sync', key, { status: 'ERROR', error: error.message || 'Could not enqueue OpenAlex sync', error_code: 'OPENALEX_QUEUE_SEND_FAILED', retryable: true });
+      await appMerge(env, 'openalex_project_sync', key, { status: 'ERROR', error: error.message || 'Could not enqueue OpenAlex sync', error_code: 'OPENALEX_QUEUE_SEND_FAILED', retryable: true });
     }
   }
   return { queued, unavailable: false };
@@ -101,12 +98,12 @@ export async function enqueueScheduledOpenAlexSyncs(env, db) {
     const key = stateId(projectId, keywordId);
     if (queuedKeys.has(key)) continue;
     queuedKeys.add(key);
-    const state = await db.get('openalex_project_sync', key);
+    const state = await appGet(env, 'openalex_project_sync', key);
     if (state?.status === 'PENDING' || state?.status === 'PROCESSING' || state?.error_code === 'OPENALEX_SYNC_PLAN_REQUIRED') continue;
     const throughDate = dateOnly(new Date());
     const mode = state?.initial_sync_complete ? 'incremental' : 'initial';
     const fromDate = state?.last_synced_date || throughDate;
-    await db.set('openalex_project_sync', key, {
+    await appSet(env, 'openalex_project_sync', key, {
       ...(state || {}), project_id: projectId, keyword_id: keywordId, ...(keywordTerm ? { keyword_term: keywordTerm } : {}),
       status: 'PENDING', mode, progress: 0, error: null, error_code: null, retryable: true, queued_at: new Date().toISOString(),
     });
@@ -117,7 +114,7 @@ export async function enqueueScheduledOpenAlexSyncs(env, db) {
       });
       queued += 1;
     } catch (error) {
-      await db.merge('openalex_project_sync', key, { status: 'ERROR', error: error.message || 'Could not enqueue OpenAlex sync', error_code: 'OPENALEX_QUEUE_SEND_FAILED', retryable: true });
+      await appMerge(env, 'openalex_project_sync', key, { status: 'ERROR', error: error.message || 'Could not enqueue OpenAlex sync', error_code: 'OPENALEX_QUEUE_SEND_FAILED', retryable: true });
     }
   }
   return queued;
@@ -128,7 +125,7 @@ export async function processOpenAlexProjectSync(db, env, message, queue) {
   const keywordId = normalizeOpenAlexKeywordId(message.keyword_id);
   if (!projectId || !keywordId) throw new Error('OpenAlex project sync is missing project_id or keyword_id');
   const key = stateId(projectId, keywordId);
-  const state = await db.get('openalex_project_sync', key) || { project_id: projectId, keyword_id: keywordId };
+  const state = await appGet(env, 'openalex_project_sync', key) || { project_id: projectId, keyword_id: keywordId };
   const mode = message.mode === 'incremental' ? 'incremental' : 'initial';
   const throughDate = message.through_date || dateOnly(new Date());
   const fromDate = message.from_date || state.last_synced_date || throughDate;
@@ -142,7 +139,7 @@ export async function processOpenAlexProjectSync(db, env, message, queue) {
     ...(keywordTerm ? { search: keywordTerm } : {}),
   };
 
-  await db.set('openalex_project_sync', key, {
+  await appSet(env, 'openalex_project_sync', key, {
     ...state, project_id: projectId, keyword_id: keywordId, ...(keywordTerm ? { keyword_term: keywordTerm } : {}), status: 'PROCESSING', mode,
     progress: Number(state.progress || 0), error: null, started_at: state.started_at || new Date().toISOString(),
   });
@@ -153,16 +150,11 @@ export async function processOpenAlexProjectSync(db, env, message, queue) {
     const works = Array.isArray(page.results) ? page.results : [];
     const relationWrites = works.map(work => {
       const workId = cleanId(work.id);
-      const source = work.primary_location?.source || work.locations?.find(location => location.is_primary)?.source || null;
       return workId ? {
         id: `${projectId}_${keywordId}_${workId}`.replace(/[^a-zA-Z0-9_-]/g, '_'),
         data: {
-          project_id: projectId, keyword_id: keywordId, ...(keywordTerm ? { keyword_term: keywordTerm } : {}), work_id: workId,
-          publication_year: work.publication_year ?? null, cited_by_count: work.cited_by_count ?? null,
-          updated_date: work.updated_date || null, synced_at: new Date().toISOString(),
-          journal_id: sourceNumericId(source?.id), journal_source_id: source?.id || null,
-          journal_name: source?.display_name || null, journal_issn: source?.issn_l || source?.issn?.[0] || null,
-          primary_topic: work.primary_topic?.id || null,
+          project_id: projectId, keyword_id: keywordId, ...(keywordTerm ? { keyword_term: keywordTerm } : {}),
+          work_id: workId, synced_at: new Date().toISOString(),
         },
       } : null;
     }).filter(Boolean);
@@ -171,7 +163,7 @@ export async function processOpenAlexProjectSync(db, env, message, queue) {
     const nextCursor = page.meta?.next_cursor;
     const syncedCount = Number(state.synced_work_count || 0) + works.length;
     if (nextCursor && works.length) {
-      await db.set('openalex_project_sync', key, {
+      await appSet(env, 'openalex_project_sync', key, {
         ...state, project_id: projectId, keyword_id: keywordId, ...(keywordTerm ? { keyword_term: keywordTerm } : {}), status: 'PENDING', mode,
         progress: null, synced_work_count: syncedCount, last_page_at: new Date().toISOString(),
         through_date: throughDate, updated_at: new Date().toISOString(),
@@ -181,7 +173,7 @@ export async function processOpenAlexProjectSync(db, env, message, queue) {
     }
 
     const completedAt = new Date().toISOString();
-    await db.set('openalex_project_sync', key, {
+    await appSet(env, 'openalex_project_sync', key, {
       ...state, project_id: projectId, keyword_id: keywordId, ...(keywordTerm ? { keyword_term: keywordTerm } : {}), status: 'COMPLETED', mode,
       progress: 100, synced_work_count: syncedCount, initial_sync_complete: true,
       last_synced_at: completedAt, last_synced_date: throughDate, through_date: throughDate,
@@ -189,7 +181,7 @@ export async function processOpenAlexProjectSync(db, env, message, queue) {
     });
   } catch (error) {
     const planRequired = error?.details?.upstream_status === 403 || /OpenAlex request failed \(403\)/.test(error?.message || '');
-    await db.set('openalex_project_sync', key, {
+    await appSet(env, 'openalex_project_sync', key, {
       ...state, project_id: projectId, keyword_id: keywordId, ...(keywordTerm ? { keyword_term: keywordTerm } : {}), status: 'ERROR', mode,
       error: error.message || 'OpenAlex sync failed', failed_at: new Date().toISOString(),
       ...(planRequired ? { error_code: 'OPENALEX_SYNC_PLAN_REQUIRED', retryable: false } : { error_code: 'OPENALEX_SYNC_FAILED', retryable: true }),
@@ -199,8 +191,8 @@ export async function processOpenAlexProjectSync(db, env, message, queue) {
   }
 }
 
-export async function projectOpenAlexSyncStatus(db, projectId, keywordIds) {
-  const states = await Promise.all(keywordIds.map(keywordId => db.get('openalex_project_sync', stateId(projectId, normalizeOpenAlexKeywordId(keywordId)))));
+export async function projectOpenAlexSyncStatus(env, projectId, keywordIds) {
+  const states = await Promise.all(keywordIds.map(keywordId => appGet(env, 'openalex_project_sync', stateId(projectId, normalizeOpenAlexKeywordId(keywordId)))));
   const rows = states.filter(Boolean);
   return {
     status: rows.some(row => row.status === 'ERROR') ? 'ERROR'
