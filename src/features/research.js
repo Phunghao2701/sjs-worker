@@ -995,6 +995,65 @@ async function journalAnalyticsData(ctx, articles, journals, mode) {
   };
 }
 
+async function openAlexCitationMirroring(ctx, citingWorks, timeframe) {
+  const targetFrequency = new Map();
+  let observedReferences = 0;
+  for (const work of citingWorks) {
+    const references = [...new Set((work.references || []).map(value => String(value || '').split('/').filter(Boolean).pop()).filter(id => /^W\d+$/.test(id)))];
+    observedReferences += references.length;
+    for (const id of references) targetFrequency.set(id, (targetFrequency.get(id) || 0) + 1);
+  }
+
+  // Resolve the most frequently cited targets in bounded 100-ID OpenAlex batches.
+  const targetIds = [...targetFrequency].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 500).map(([id]) => id);
+  const batches = [];
+  for (let index = 0; index < targetIds.length; index += 100) batches.push(targetIds.slice(index, index + 100));
+  const targetResults = await Promise.all(batches.map(ids => openAlexRequest(ctx, 'works', {
+    filter: `ids.openalex:${ids.join('|')}`,
+    per_page: 100,
+    select: 'id,authorships',
+  })));
+  const targetAuthors = new Map();
+  for (const result of targetResults) for (const target of result.results || []) {
+    const id = String(target.id || '').split('/').filter(Boolean).pop();
+    const authorIds = (target.authorships || []).map(item => String(item.author?.id || '').split('/').filter(Boolean).pop()).filter(id => /^A\d+$/.test(id));
+    if (id && authorIds.length) targetAuthors.set(id, new Set(authorIds));
+  }
+
+  const counts = new Map(timeframe.map(year => [year, { year, self: 0, external: 0 }]));
+  let resolvedReferences = 0;
+  for (const work of citingWorks) {
+    const point = counts.get(yearOf(work));
+    if (!point) continue;
+    const citingAuthors = new Set((work.authors || []).map(author => String(author.openalex_id || '').split('/').filter(Boolean).pop()).filter(id => /^A\d+$/.test(id)));
+    if (!citingAuthors.size) continue;
+    for (const reference of [...new Set(work.references || [])]) {
+      const targetId = String(reference || '').split('/').filter(Boolean).pop();
+      const citedAuthors = targetAuthors.get(targetId);
+      if (!citedAuthors) continue;
+      resolvedReferences += 1;
+      const isSelfCitation = [...citingAuthors].some(id => citedAuthors.has(id));
+      point[isSelfCitation ? 'self' : 'external'] += 1;
+    }
+  }
+
+  const available = resolvedReferences > 0;
+  return {
+    available,
+    reason: available ? null : 'OpenAlex returned no resolvable citation links for the selected works and timeframe.',
+    method: 'A citation is self-citation when the citing and cited OpenAlex works share at least one author ID.',
+    coverage: {
+      citingWorks: citingWorks.length,
+      observedReferences,
+      resolvedReferences,
+      unresolvedReferences: Math.max(0, observedReferences - resolvedReferences),
+      targetWorksResolved: targetAuthors.size,
+      targetWorksLimit: 500,
+      truncated: targetFrequency.size > 500,
+    },
+    data: [...counts.values()],
+  };
+}
 async function sourceDevelopmentTrends(ctx) {
   const { query, db } = ctx;
   const currentYear = new Date().getFullYear();
@@ -1038,13 +1097,7 @@ async function sourceDevelopmentTrends(ctx) {
   const publicationData = [...yearly.values()];
   const previous = publicationData.at(-2)?.value || 0; const current = publicationData.at(-1)?.value || 0;
   const growthRate = previous ? Math.round((current - previous) / previous * 1000) / 10 : 0;
-  // OpenAlex does not expose a project-level self-citation split. Leave this
-  // unavailable instead of rendering the former invented 15%/85% breakdown.
-  const citationMirroring = {
-    available: false,
-    reason: 'OpenAlex does not provide a project-level self-citation breakdown.',
-    data: [],
-  };
+  const citationMirroring = await openAlexCitationMirroring(ctx, articles, timeframe);
 
   const topicRows = new Map();
   for (const article of articles) {
