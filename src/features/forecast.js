@@ -1,5 +1,6 @@
 import { HttpError } from '../core/http.js';
 import { all, byId, hydrateArticles, isDeleted } from '../firestore/repository.js';
+import { projectRows } from '../firestore/project-cache.js';
 
 const round = (value, digits = 1) => Number.isFinite(value) ? Math.round(value * 10 ** digits) / 10 ** digits : 0;
 const divide = (numerator, denominator) => denominator ? numerator / denominator : 0;
@@ -89,7 +90,7 @@ export async function forecastInsights(db, projectId) {
   if (!projectId) throw new HttpError(400, 'project_id is required', 'VALIDATION_ERROR');
   const [project, areas, categories, topics, keywords, projectKeywords, articleDocs] = await Promise.all([
     byId(db, 'projects', projectId), all(db, 'subjectAreas'), all(db, 'subjectCategories'), all(db, 'topics'), all(db, 'keywords'),
-    all(db, 'project_keywords'), all(db, 'articles'),
+    projectRows(db, 'project_keywords', projectId), all(db, 'articles'),
   ]);
   const articles = await hydrateArticles(db, articleDocs);
   if (!project) throw new HttpError(404, 'Project not found or has no associated subject area', 'NOT_FOUND');
@@ -99,7 +100,7 @@ export async function forecastInsights(db, projectId) {
   const subjectAreaId = String(area.subject_area_id || area.id);
   const subjectAreaName = area.display_name || area.name;
   const categoryIds = new Set(categories.filter(row => String(row.subject_area_id) === subjectAreaId && !isDeleted(row)).map(row => String(row.subject_category_id || row.id)));
-  const keywordIds = new Set(projectKeywords.filter(row => String(row.project_id) === String(projectId)).map(row => String(row.keyword_id)).filter(Boolean));
+  const keywordIds = new Set(projectKeywords.map(row => String(row.keyword_id)).filter(Boolean));
   const keywordById = new Map(keywords.map(row => [String(row.keyword_id || row.id), row]));
   const keywordNames = [...keywordIds].map(id => keywordById.get(id)?.display_name || keywordById.get(id)?.name).filter(Boolean);
   const topicById = new Map(topics.map(row => [String(row.topic_id || row.id), row]));

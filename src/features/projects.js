@@ -5,6 +5,7 @@ import { openAlexWorkToLegacy } from '../openalex/adapters.js';
 import { openAlexRequest } from '../openalex/client.js';
 import { enrichProjectsWithOpenAlex, loadProjectResearchScopes } from '../openalex/project-dashboard.js';
 import { enqueueProjectKeywordSyncs, normalizeOpenAlexKeywordId, projectOpenAlexSyncStatus } from '../openalex/project-sync.js';
+import { projectRows } from '../firestore/project-cache.js';
 
 const memberKey = (projectId, userId) => `${projectId}_${userId}`;
 const userKey = user => String(user?.user_id || user?.id);
@@ -15,8 +16,14 @@ export async function requireProject(ctx, projectId, { includeDeleted = false } 
   const uid = userKey(ctx.user);
   const owner = String(project.user_id || project.owner_id || project.created_by || '') === uid;
   const isAcceptedMember = row => row && String(row.project_id) === String(projectId) && String(row.user_id) === uid && row.status === 'ACCEPTED';
-  const directMember = await ctx.db.get('project_members', memberKey(projectId, uid));
-  const member = isAcceptedMember(directMember) ? directMember : (await find(ctx.db, 'project_members', isAcceptedMember, { limit: 1 }))[0];
+  const member = owner ? null : (await ctx.db.query('project_members', {
+    filters: [
+      { field: 'project_id', op: 'EQUAL', value: String(projectId) },
+      { field: 'user_id', op: 'EQUAL', value: uid },
+      { field: 'status', op: 'EQUAL', value: 'ACCEPTED' },
+    ],
+    limit: 1,
+  })).find(isAcceptedMember) || null;
   if (!owner && !member) throw new HttpError(403, 'Project access denied', 'FORBIDDEN');
   return { ...project, _isOwner: owner, _membership: member };
 }
@@ -24,7 +31,13 @@ export async function requireProject(ctx, projectId, { includeDeleted = false } 
 async function projectList(ctx) {
   const uid = userKey(ctx.user);
   const includeDeleted = ctx.query.includeDeleted === 'true' || ctx.query.status === 'ALL';
-  const memberships = await find(ctx.db, 'project_members', row => String(row.user_id) === uid && row.status === 'ACCEPTED', { limit: Infinity });
+  const memberships = await ctx.db.query('project_members', {
+    filters: [
+      { field: 'user_id', op: 'EQUAL', value: uid },
+      { field: 'status', op: 'EQUAL', value: 'ACCEPTED' },
+    ],
+    limit: 1000,
+  });
   const sharedIds = new Set(memberships.map(row => String(row.project_id)));
   const rows = (await all(ctx.db, 'projects')).filter(row => (includeDeleted || !isDeleted(row)) && (String(row.user_id || row.owner_id || row.created_by) === uid || sharedIds.has(String(row.id || row.project_id))));
   const scopes = await loadProjectResearchScopes(ctx.db, rows);
@@ -87,7 +100,7 @@ async function updateProject(ctx) {
   if (ctx.body.subject_category_ids !== undefined) await writeProjectLinks(ctx.db, ctx.params.id, 'subject_category_projects', 'subject_category_id', ctx.body.subject_category_ids);
   if (ctx.body.keyword_ids !== undefined || ctx.body.keywords !== undefined) {
     await writeProjectLinks(ctx.db, ctx.params.id, 'project_keywords', 'keyword_id', ctx.body.keyword_ids || ctx.body.keywords);
-    const keywordRows = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.id), { limit: Infinity });
+    const keywordRows = await projectRows(ctx.db, 'project_keywords', ctx.params.id);
     await enqueueProjectKeywordSyncs(ctx.env, ctx.db, ctx.params.id, keywordRows.map(row => row.keyword_id));
   }
   return ok(update, 'Project updated successfully', 'SUCCESS_UPDATE_PROJECT');
@@ -95,7 +108,7 @@ async function updateProject(ctx) {
 
 async function writeProjectLinks(db, projectId, collection, field, values, { replace = true } = {}) {
   if (replace) {
-    const existing = await find(db, collection, row => String(row.project_id) === String(projectId), { limit: Infinity });
+    const existing = await projectRows(db, collection, projectId);
     if (existing.length) await db.batchDelete(collection, existing.map(row => row.id));
   }
   const rows = [...new Set((values || []).map(value => {
@@ -141,7 +154,7 @@ async function activateProject(ctx) {
 
 async function projectArticles(ctx) {
   const project = await requireProject(ctx, ctx.params.id);
-  const keywordRows = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.id), { limit: Infinity });
+  const keywordRows = await projectRows(ctx.db, 'project_keywords', ctx.params.id);
   const queries = await projectOpenAlexQueries(ctx, project, keywordRows);
   const page = Math.max(1, Number.parseInt(ctx.query.page, 10) || 1);
   const limit = Math.min(100, Math.max(1, Number.parseInt(ctx.query.limit, 10) || 10));
@@ -162,7 +175,7 @@ async function projectArticles(ctx) {
 
 async function projectOverview(ctx) {
   const project = await requireProject(ctx, ctx.params.id);
-  const keywords = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.id), { limit: Infinity });
+  const keywords = await projectRows(ctx.db, 'project_keywords', ctx.params.id);
   const queries = await projectOpenAlexQueries(ctx, project, keywords);
   const [yearPages, domainPages, typePages, sourcePages] = await Promise.all([
     Promise.all(queries.map(query => groupedProjectWorks(ctx, query, 'publication_year'))),
@@ -196,7 +209,7 @@ async function projectOverview(ctx) {
 
 async function projectAnalytics(ctx) {
   const project = await requireProject(ctx, ctx.params.id);
-  const keywords = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.id), { limit: Infinity });
+  const keywords = await projectRows(ctx.db, 'project_keywords', ctx.params.id);
   const queries = await projectOpenAlexQueries(ctx, project, keywords);
   const pages = await Promise.all(queries.map(query => groupedProjectWorks(ctx, query, 'publication_year')));
   const publicationsByYear = mergeGroups(pages, group => String(group.key)).map(row => ({ year: Number(row.name), count: row.value }));
@@ -228,8 +241,8 @@ async function projectOpenAlexQueries(ctx, project, keywordRows) {
 
   const projectId = String(project.project_id || project.id);
   const [journalLinks, categoryLinks] = await Promise.all([
-    find(ctx.db, 'project_journals', row => String(row.project_id) === projectId, { limit: Infinity }),
-    find(ctx.db, 'subject_category_projects', row => String(row.project_id) === projectId, { limit: Infinity }),
+    projectRows(ctx.db, 'project_journals', projectId),
+    projectRows(ctx.db, 'subject_category_projects', projectId),
   ]);
   const journalValues = [...(project.journal_ids || []), ...journalLinks.map(row => row.journal_id)];
   const categoryValues = [...(project.subject_category_ids || []), ...categoryLinks.map(row => row.subject_category_id)];
@@ -260,16 +273,16 @@ function toChart(rows, label) {
   return { labels: rows.map(row => row.name), datasets: [{ label, data: rows.map(row => row.value) }] };
 }
 async function projectKeywordIds(ctx, projectId) {
-  const rows = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(projectId), { limit: Infinity });
+  const rows = await projectRows(ctx.db, 'project_keywords', projectId);
   return [...new Set(rows.map(row => String(row.keyword_id || row.keyword || '').trim()).filter(Boolean))].slice(0, 100);
 }
 
 async function projectScopedArticles(ctx, project) {
   const projectId = String(project.project_id || project.id);
   const [journalLinks, categoryLinks, articleScopes] = await Promise.all([
-    find(ctx.db, 'project_journals', row => String(row.project_id) === projectId, { limit: Infinity }),
-    find(ctx.db, 'subject_category_projects', row => String(row.project_id) === projectId, { limit: Infinity }),
-    find(ctx.db, 'project_article_scopes', row => String(row.project_id) === projectId, { limit: Infinity }),
+    projectRows(ctx.db, 'project_journals', projectId),
+    projectRows(ctx.db, 'subject_category_projects', projectId),
+    projectRows(ctx.db, 'project_article_scopes', projectId),
   ]);
   const journals = new Set([...(project.journal_ids || []), ...journalLinks.map(row => row.journal_id)].map(String));
   const categories = new Set([...(project.subject_category_ids || []), ...categoryLinks.map(row => row.subject_category_id)].map(String));
@@ -330,7 +343,7 @@ async function removeMember(ctx) {
 
 async function listProjectKeywords(ctx) {
   await requireProject(ctx, ctx.params.projectId);
-  const rows = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.projectId), { limit: Infinity });
+  const rows = await projectRows(ctx.db, 'project_keywords', ctx.params.projectId);
   return ok(rows, 'Project keywords fetched successfully');
 }
 
@@ -356,11 +369,11 @@ async function watchKeywords(ctx, replace = false) {
   const validKeywords = resolvedKeywords.filter(Boolean);
   const values = [...new Set(validKeywords.map(row => row.keywordId))];
   if (replace) {
-    const prior = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.projectId), { limit: Infinity });
+    const prior = await projectRows(ctx.db, 'project_keywords', ctx.params.projectId);
     await ctx.db.batchDelete('project_keywords', prior.map(row => row.id));
   } else {
     const normalizedValues = new Set(values.map(normalizeOpenAlexKeywordId));
-    const existing = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.projectId) && normalizedValues.has(normalizeOpenAlexKeywordId(row.keyword_id)), { limit: Infinity });
+    const existing = (await projectRows(ctx.db, 'project_keywords', ctx.params.projectId)).filter(row => normalizedValues.has(normalizeOpenAlexKeywordId(row.keyword_id)));
     if (existing.length) throw new HttpError(400, 'Some keywords are already watched', 'ERROR_KEYWORDS_ALREADY_WATCHED');
   }
   const docs = validKeywords.map(({ keywordId, keyword }) => {
@@ -383,7 +396,7 @@ async function unwatchKeyword(ctx) {
 
 async function trendingKeywords(ctx) {
   await requireProject(ctx, ctx.params.projectId);
-  const watched = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.projectId), { limit: Infinity });
+  const watched = await projectRows(ctx.db, 'project_keywords', ctx.params.projectId);
   const keywordIds = new Set(watched.map(row => String(row.keyword_id)));
   const limit = Math.min(100, Math.max(1, Number.parseInt(ctx.query.limit, 10) || 20));
   const requestedSort = ctx.query.sort_by;
@@ -408,7 +421,7 @@ async function trendingKeywords(ctx) {
 
 async function watchedArticles(ctx) {
   const project = await requireProject(ctx, ctx.params.projectId);
-  const keywordRows = await find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.params.projectId), { limit: Infinity });
+  const keywordRows = await projectRows(ctx.db, 'project_keywords', ctx.params.projectId);
   const queries = await projectOpenAlexQueries(ctx, project, keywordRows);
   const page = Math.max(1, Number.parseInt(ctx.query.page, 10) || 1);
   const limit = Math.min(50, Math.max(1, Number.parseInt(ctx.query.limit, 10) || 10));

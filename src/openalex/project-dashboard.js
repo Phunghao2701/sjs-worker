@@ -1,4 +1,4 @@
-import { all } from '../firestore/repository.js';
+import { projectRows } from '../firestore/project-cache.js';
 import { openAlexRequest } from './client.js';
 
 const suffix = value => String(value ?? '').trim().replace(/^https?:\/\/(?:www\.)?openalex\.org\//i, '').replace(/\/+$/, '').split('/').pop();
@@ -29,11 +29,13 @@ const yearFilter = (fromYear, toYear) => {
 };
 
 export async function loadProjectResearchScopes(db, projects) {
-  const [journalLinks, keywordLinks, categoryLinks] = await Promise.all([
-    all(db, 'project_journals'), all(db, 'project_keywords'), all(db, 'subject_category_projects'),
-  ]);
-  return projects.map(project => {
+  return Promise.all(projects.map(async project => {
     const id = String(project.project_id || project.id);
+    const [journalLinks, keywordLinks, categoryLinks] = await Promise.all([
+      projectRows(db, 'project_journals', id),
+      projectRows(db, 'project_keywords', id),
+      projectRows(db, 'subject_category_projects', id),
+    ]);
     const areaIds = normalizeList([project.subject_area, project.subject_area_id].filter(Boolean), 'domains/');
     const categoryIds = unique([
       ...(project.subject_category_ids || []).map(value => normalizeId(value?.id ?? value, 'fields/')).filter(Boolean),
@@ -53,7 +55,7 @@ export async function loadProjectResearchScopes(db, projects) {
     const domainIds = areaIds.map(value => normalizeId(value, 'domains/')).filter(Boolean);
     const filters = [orFilter('keywords.id', keywordIds), orFilter('primary_location.source.id', journalIds), orFilter('primary_topic.domain.id', domainIds), domainIds.length ? null : orFilter('primary_topic.field.id', categoryIds)].filter(Boolean);
     return { project, id, keywordIds, keywordTerms, journalIds, domainIds, categoryIds, filters };
-  });
+  }));
 }
 
 async function groupedWorks(ctx, filter, groupBy) {

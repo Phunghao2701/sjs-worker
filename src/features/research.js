@@ -7,6 +7,7 @@ import { openAlexRequest } from '../openalex/client.js';
 import { loadProjectResearchScopes, openAlexPublicationTrends, openAlexTrendingKeywords } from '../openalex/project-dashboard.js';
 import { normalizeOpenAlexKeywordId } from '../openalex/project-sync.js';
 import { forecastInsights } from './forecast.js';
+import { projectRows } from '../firestore/project-cache.js';
 
 const articleText = ['title', 'abstract', 'description', 'keywords', 'doi'];
 const normalizeGraphSearchText = value => String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -76,10 +77,10 @@ const filteredArticles = async (ctx) => {
     if (!project) throw new HttpError(404, 'Project not found', 'PROJECT_NOT_FOUND');
     const projectId = String(project?.project_id || project?.id || ctx.query.project_id);
     const [journalLinks, categoryLinks, articleScopes, projectKeywordLinks, subjectAreas, subjectCategories, topics] = await Promise.all([
-      find(ctx.db, 'project_journals', row => String(row.project_id) === projectId, { limit: Infinity }),
-      find(ctx.db, 'subject_category_projects', row => String(row.project_id) === projectId, { limit: Infinity }),
-      find(ctx.db, 'project_article_scopes', row => String(row.project_id) === projectId, { limit: Infinity }),
-      find(ctx.db, 'project_keywords', row => String(row.project_id) === projectId, { limit: Infinity }),
+      projectRows(ctx.db, 'project_journals', projectId),
+      projectRows(ctx.db, 'subject_category_projects', projectId),
+      projectRows(ctx.db, 'project_article_scopes', projectId),
+      projectRows(ctx.db, 'project_keywords', projectId),
       all(ctx.db, 'subjectAreas'), all(ctx.db, 'subjectCategories'), all(ctx.db, 'topics'),
     ]);
     const journals = new Set([...(project?.journal_ids || []), ...journalLinks.map(row => row.journal_id)].map(String));
@@ -159,7 +160,7 @@ async function publicationTrend(ctx) {
 
   const [rawArticles, categories, areas, topics, keywords, projectKeywords] = await Promise.all([
     all(db, 'articles'), all(db, 'subjectCategories'), all(db, 'subjectAreas'), all(db, 'topics'), all(db, 'keywords'),
-    hasProject ? find(db, 'project_keywords', row => String(row.project_id) === String(query.project_id), { limit: Infinity }) : Promise.resolve([]),
+    hasProject ? projectRows(db, 'project_keywords', query.project_id) : Promise.resolve([]),
   ]);
   const articles = (await hydrateArticles(db, rawArticles)).filter(row => !isDeleted(row) && row.publication_year != null);
   const activeCategories = categories.filter(row => !isDeleted(row));
@@ -316,7 +317,7 @@ async function distributionData(ctx) {
 
   if (hasProject) {
     await requireProject(ctx, query.project_id);
-    const scopedIds = new Set((await find(db, 'project_article_scopes', row => String(row.project_id) === String(query.project_id), { limit: Infinity })).map(row => String(row.article_id)));
+    const scopedIds = new Set((await projectRows(db, 'project_article_scopes', query.project_id)).map(row => String(row.article_id)));
     articles = articles.filter(row => scopedIds.has(String(row.article_id || row.id)));
   }
 
@@ -527,7 +528,7 @@ async function topEntities(ctx, articles) {
   const [institutions, institutionAuthors, authors, areas, categories, topics, projectKeywords] = await Promise.all([
     all(ctx.db, 'institutions'), all(ctx.db, 'institution_authors'), all(ctx.db, 'authors'),
     all(ctx.db, 'subjectAreas'), all(ctx.db, 'subjectCategories'), all(ctx.db, 'topics'),
-    find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.query.project_id), { limit: Infinity }),
+    projectRows(ctx.db, 'project_keywords', ctx.query.project_id),
   ]);
   // Match getProjectScope(): resolve the project's subject area and include
   // only non-deleted categories under that area.
@@ -705,7 +706,7 @@ async function geoDistributionData(ctx) {
 
   const [rawArticles, topics, categories, areas, keywordRows, keywordLinks, subTopics, scopes, zones, issues, volumes, journals] = await Promise.all([
     all(db, 'articles'), all(db, 'topics'), all(db, 'subjectCategories'), all(db, 'subjectAreas'), all(db, 'keywords'),
-    all(db, 'keyword_articles'), all(db, 'sub_topics'), hasProject ? find(db, 'project_article_scopes', row => String(row.project_id) === String(projectId), { limit: Infinity }) : Promise.resolve([]),
+    all(db, 'keyword_articles'), all(db, 'sub_topics'), hasProject ? projectRows(db, 'project_article_scopes', projectId) : Promise.resolve([]),
     all(db, 'zones'), all(db, 'issues'), all(db, 'volumes'), all(db, 'journals'),
   ]);
   let articles = (await hydrateArticles(db, rawArticles)).filter(row => !isDeleted(row));
@@ -1343,7 +1344,7 @@ async function dashboardSearch(ctx) {
     selectedTypes.includes('topic') || ctx.query.project_id ? all(ctx.db, 'topics') : Promise.resolve([]),
     ctx.query.project_id ? all(ctx.db, 'subjectAreas') : Promise.resolve([]),
     ctx.query.project_id ? all(ctx.db, 'subjectCategories') : Promise.resolve([]),
-    ctx.query.project_id ? find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.query.project_id), { limit: Infinity }) : Promise.resolve([]),
+    ctx.query.project_id ? projectRows(ctx.db, 'project_keywords', ctx.query.project_id) : Promise.resolve([]),
     selectedTypes.includes('author') || selectedTypes.includes('institution') ? all(ctx.db, 'author_articles') : Promise.resolve([]),
     selectedTypes.includes('institution') ? all(ctx.db, 'institution_authors') : Promise.resolve([]),
     selectedTypes.includes('keyword') && ctx.query.project_id ? all(ctx.db, 'keyword_articles') : Promise.resolve([]),
@@ -1510,7 +1511,7 @@ async function searchEntities(ctx) {
     const projectArea = String(project.subject_area || project.subject_area_id || '');
     const [areas, categories, topics, projectKeywords, subTopics] = await Promise.all([
       all(ctx.db, 'subjectAreas'), all(ctx.db, 'subjectCategories'), all(ctx.db, 'topics'),
-      find(ctx.db, 'project_keywords', row => String(row.project_id) === projectId), all(ctx.db, 'sub_topics'),
+      projectRows(ctx.db, 'project_keywords', projectId), all(ctx.db, 'sub_topics'),
     ]);
     const area = areas.find(row => String(row.subject_area_id || row.id) === projectArea || String(row.display_name || row.name || '').toLowerCase() === projectArea.toLowerCase());
     if (!area) throw new HttpError(404, 'Project not found or has no associated subject area', 'NOT_FOUND');
@@ -2934,7 +2935,7 @@ async function projectKeywords(ctx) {
   await requireProject(ctx, projectId);
   if (ctx.request.method === 'GET') {
     const [links, keywords] = await Promise.all([
-      find(ctx.db, 'project_keywords', row => String(row.project_id) === projectId, { limit: Infinity }), all(ctx.db, 'keywords'),
+      projectRows(ctx.db, 'project_keywords', projectId), all(ctx.db, 'keywords'),
     ]);
     const keywordById = new Map(keywords.map(row => [String(row.keyword_id || row.id), row]));
     return ok(links.flatMap(link => {
@@ -2953,7 +2954,7 @@ async function projectKeywords(ctx) {
       await ctx.db.set('keywords', key, keyword);
     }
     const keywordId = String(keyword.keyword_id || keyword.id);
-    const existing = await find(ctx.db, 'project_keywords', row => String(row.project_id) === projectId && String(row.keyword_id) === keywordId, { limit: 1 });
+    const existing = (await projectRows(ctx.db, 'project_keywords', projectId)).filter(row => String(row.keyword_id) === keywordId).slice(0, 1);
     if (!existing.length) {
       const linkId = `${projectId}_${keywordId}`;
       await ctx.db.set('project_keywords', linkId, { id: linkId, project_id: projectId, keyword_id: keyword.keyword_id || keyword.id, keyword: keyword.display_name || name, created_at: nowIso() });
@@ -3040,7 +3041,7 @@ const analyticsPaths = ['trends','journals/impact-matrix','frontier','distributi
 export const researchRoutes = defineRoutes([
   ...analyticsPaths.map(path => ({ method: 'GET', path: `/analytics/${path}`, auth: true, handler: analytics })),
   { method: 'POST', path: '/analytics/project-keywords', auth: true, handler: analytics },
-  { method: 'DELETE', path: '/analytics/project-keywords/:keyword_id', auth: true, handler: async ctx => { const projectId = String(ctx.query.project_id || ''); await requireProject(ctx, projectId); const rows = await find(ctx.db, 'project_keywords', row => String(row.project_id) === projectId && String(row.keyword_id) === String(ctx.params.keyword_id), { limit: 1 }); if (rows[0]) await ctx.db.delete('project_keywords', rows[0].id); return ok(undefined, 'Project keyword removed successfully'); } },
+  { method: 'DELETE', path: '/analytics/project-keywords/:keyword_id', auth: true, handler: async ctx => { const projectId = String(ctx.query.project_id || ''); await requireProject(ctx, projectId); const rows = (await projectRows(ctx.db, 'project_keywords', projectId)).filter(row => String(row.keyword_id) === String(ctx.params.keyword_id)).slice(0, 1); if (rows[0]) await ctx.db.delete('project_keywords', rows[0].id); return ok(undefined, 'Project keyword removed successfully'); } },
   { method: 'GET', path: '/analytics/jobs/:id', auth: true, handler: async ctx => {
     const job = await byId(ctx.db, 'analyticsJobs', ctx.params.id);
     if (!job) throw new HttpError(404, 'Job not found', 'NOT_FOUND');

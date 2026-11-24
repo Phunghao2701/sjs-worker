@@ -1,6 +1,7 @@
 import { isScimagoCollection, d1Get, d1ListAll, d1Query, d1Write, d1Delete } from './scimago-d1.js';
 import { HttpError } from '../core/http.js';
 import { decodeDocument, encodeFields, encodeValue, vectorValue } from './codec.js';
+import { invalidateProjectLinkCache } from './project-cache.js';
 
 const tokenCache = new Map();
 const textEncoder = new TextEncoder();
@@ -130,6 +131,7 @@ export class FirestoreClient {
       method: 'PATCH',
       body: JSON.stringify({ name, fields: encodeFields(data) }),
     });
+    invalidateProjectLinkCache(collection, data?.project_id);
     return result;
   }
 
@@ -143,6 +145,7 @@ export class FirestoreClient {
       method: 'PATCH',
       body: JSON.stringify({ name, fields: encodeFields(data) }),
     });
+    invalidateProjectLinkCache(collection, data?.project_id);
     return result;
   }
 
@@ -154,6 +157,7 @@ export class FirestoreClient {
       method: 'POST',
       body: JSON.stringify({ fields: encodeFields(data) }),
     });
+    invalidateProjectLinkCache(collection, data?.project_id);
     return result;
   }
 
@@ -161,6 +165,7 @@ export class FirestoreClient {
     if (isScimagoCollection(collection) && !this.env.RANKINGS_DB) throw new HttpError(503, 'SCImago D1 database is not configured', 'SCIMAGO_D1_NOT_CONFIGURED');
     if (isScimagoCollection(collection) && this.env.RANKINGS_DB) return d1Delete(this.env.RANKINGS_DB, collection, [id]);
     const result = await this.request(`/${collection}/${encodeURIComponent(String(id))}`, { method: 'DELETE' });
+    invalidateProjectLinkCache(collection);
     return result;
   }
 
@@ -233,6 +238,7 @@ export class FirestoreClient {
         throw new HttpError(502, 'One or more Firestore batch writes failed', 'FIRESTORE_BATCH_FAILED');
       }
     }
+    invalidateProjectLinkCache(collection);
   }
 
   async batchDelete(collection, ids) {
@@ -242,6 +248,7 @@ export class FirestoreClient {
     for (let start = 0; start < writes.length; start += 400) {
       await this.request(':commit', { method: 'POST', body: JSON.stringify({ writes: writes.slice(start, start + 400) }) });
     }
+    invalidateProjectLinkCache(collection);
   }
 
   async beginTransaction() {
