@@ -1825,17 +1825,18 @@ async function collaborationScopedArticles(ctx, { summary = false } = {}) {
     : [
       'id', 'display_name', 'publication_year', 'publication_date', 'type', 'doi', 'cited_by_count',
       'referenced_works_count', 'referenced_works', 'ids', 'language', 'primary_location', 'authorships',
-      'primary_topic', 'topics', 'keywords', 'abstract_inverted_index',
+      'primary_topic', 'topics', 'keywords', 'open_access', 'abstract_inverted_index',
     ]).join(',');
+  const accessFilter = ctx.query.is_open_access === 'true' || ctx.query.is_open_access === true ? 'open_access.is_oa:true' : null;
   const requests = [];
   for (const filter of scope.filters.slice(0, 4)) {
     requests.push(openAlexRequest(ctx, 'works', {
-      filter: [filter, yearFilter].filter(Boolean).join(','), per_page: 100, select,
+      filter: [filter, yearFilter, accessFilter].filter(Boolean).join(','), per_page: 100, select,
     }));
   }
   for (const search of terms.slice(0, 6)) {
     requests.push(openAlexRequest(ctx, 'works', {
-      search, ...(yearFilter ? { filter: yearFilter } : {}), per_page: 100, select,
+      search, ...([yearFilter, accessFilter].filter(Boolean).length ? { filter: [yearFilter, accessFilter].filter(Boolean).join(',') } : {}), per_page: 100, select,
     }));
   }
   const results = await Promise.all(requests);
@@ -2023,7 +2024,7 @@ async function collaborationInsights(ctx, articles) {
   const growth = topPair ? `${topPair.growth.startsWith('+') ? topPair.growth : `+${topPair.growth}`} YoY` : null;
   let emergingKeyword = ''; let criticalKeyword = '';
   try {
-    const vectors = await keywordVectors({ ...ctx, query: { ...ctx.query, limit: 3 } }, articles);
+    const vectors = await sourceKeywordVectors({ ...ctx, query: { ...ctx.query, limit: 3 } });
     emergingKeyword = vectors[0]?.keyword || vectors[0]?.name || '';
     criticalKeyword = vectors[1]?.keyword || vectors[1]?.name || '';
   } catch { /* source endpoint falls back silently when keyword analysis is unavailable */ }
@@ -2118,37 +2119,55 @@ async function sourceTopology(ctx) {
   if (!['all', 'conceptual', 'collaboration'].includes(networkType)) throw new HttpError(400, 'network_type must be all, conceptual, or collaboration', 'VALIDATION_ERROR');
   const limitNodes = number(ctx.query.limit_nodes, 50); const minWeight = number(ctx.query.min_weight, 0.1);
   if (!Number.isInteger(limitNodes) || limitNodes < 1 || limitNodes > 150 || !Number.isFinite(minWeight) || minWeight < 0) throw new HttpError(400, 'Invalid network limits', 'VALIDATION_ERROR');
-  const [authors, keywords, authorLinks, keywordLinks] = await Promise.all([
-    all(ctx.db, 'authors'), all(ctx.db, 'keywords'), all(ctx.db, 'author_articles'), all(ctx.db, 'keyword_articles'),
-  ]);
-  const authorById = new Map(authors.map(row => [String(row.author_id || row.id), row]));
-  const keywordById = new Map(keywords.map(row => [String(row.keyword_id || row.id), row]));
-  const articleIds = new Set(articles.map(row => String(row.article_id || row.id)));
-  const keywordsByArticle = new Map(); const authorsByArticle = new Map();
-  const add = (map, key, value) => { if (!map.has(key)) map.set(key, new Set()); map.get(key).add(value); };
-  for (const link of keywordLinks) if (articleIds.has(String(link.article_id))) add(keywordsByArticle, String(link.article_id), String(link.keyword_id));
-  for (const link of authorLinks) if (articleIds.has(String(link.article_id))) add(authorsByArticle, String(link.article_id), String(link.author_id));
-  const nodes = []; const edges = [];
-  if (networkType === 'all' || networkType === 'conceptual') {
-    const counts = new Map(); const pairs = new Map();
-    for (const articleId of articleIds) {
-      const ids = [...(keywordsByArticle.get(articleId) || [])].sort();
-      for (const id of ids) counts.set(id, (counts.get(id) || 0) + 1);
-      for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) pairs.set(`${ids[i]}|${ids[j]}`, (pairs.get(`${ids[i]}|${ids[j]}`) || 0) + 1);
+  // Build this network from live OpenAlex works; the legacy academic join
+  // tables are intentionally not populated for this data path.
+  const nodeMap = new Map(); const pairCounts = new Map();
+  const addNode = (id, label, type) => {
+    const current = nodeMap.get(id) || { id, label: label || 'Unknown', type, size: 0 };
+    current.size += 1;
+    nodeMap.set(id, current);
+  };
+  const addPairs = (ids, type) => {
+    const uniqueIds = [...new Set(ids)].sort();
+    for (let i = 0; i < uniqueIds.length; i++) for (let j = i + 1; j < uniqueIds.length; j++) {
+      const key = `${type}|${uniqueIds[i]}|${uniqueIds[j]}`;
+      pairCounts.set(key, (pairCounts.get(key) || 0) + 1);
     }
-    for (const [id, size] of counts) nodes.push({ id: `kw_${id}`, label: keywordById.get(id)?.display_name || 'Unknown', type: 'KEYWORD', size });
-    for (const [pair, weight] of pairs) { const [from, to] = pair.split('|'); edges.push({ from: `kw_${from}`, to: `kw_${to}`, type: 'CONCEPTUAL_PROXIMITY', weight }); }
-  }
-  if (networkType === 'all' || networkType === 'collaboration') {
-    const counts = new Map(); const pairs = new Map();
-    for (const articleId of articleIds) {
-      const ids = [...(authorsByArticle.get(articleId) || [])].sort();
-      for (const id of ids) counts.set(id, (counts.get(id) || 0) + 1);
-      for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) pairs.set(`${ids[i]}|${ids[j]}`, (pairs.get(`${ids[i]}|${ids[j]}`) || 0) + 1);
+  };
+  for (const article of articles) {
+    if (networkType === 'all' || networkType === 'conceptual') {
+      const keywordMap = new Map();
+      for (const item of article.keyword_objects || []) {
+        const label = String(item?.display_name || item?.name || '').trim();
+        if (!label) continue;
+        keywordMap.set(label.toLocaleLowerCase(), label);
+      }
+      for (const value of article.keywords || []) {
+        const label = String(value || '').trim();
+        if (!label) continue;
+        keywordMap.set(label.toLocaleLowerCase(), label);
+      }
+      const ids = [...keywordMap.keys()].map(key => `kw_${key}`);
+      for (const [key, label] of keywordMap) addNode(`kw_${key}`, label, 'KEYWORD');
+      addPairs(ids, 'CONCEPTUAL_PROXIMITY');
     }
-    for (const [id, size] of counts) nodes.push({ id: `auth_${id}`, label: authorById.get(id)?.display_name || 'Unknown', type: 'AUTHOR', size });
-    for (const [pair, weight] of pairs) { const [from, to] = pair.split('|'); edges.push({ from: `auth_${from}`, to: `auth_${to}`, type: 'CO_AUTHORSHIP', weight }); }
+    if (networkType === 'all' || networkType === 'collaboration') {
+      const authorMap = new Map();
+      for (const author of article.authors || []) {
+        const label = String(author?.display_name || '').trim();
+        const rawId = author?.openalex_id || author?.author_id || label;
+        if (label && rawId) authorMap.set(`auth_${rawId}`, label);
+      }
+      const ids = [...authorMap.keys()];
+      for (const [id, label] of authorMap) addNode(id, label, 'AUTHOR');
+      addPairs(ids, 'CO_AUTHORSHIP');
+    }
   }
+  const nodes = [...nodeMap.values()];
+  const edges = [...pairCounts].map(([key, weight]) => {
+    const [type, from, to] = key.split('|');
+    return { from, to, type, weight };
+  });
   if (!nodes.length) return { nodes: [], edges: [] };
   nodes.sort((a, b) => b.size - a.size);
   const topNodes = nodes.slice(0, limitNodes); const allowed = new Set(topNodes.map(node => node.id));
@@ -2202,140 +2221,86 @@ async function sourceCrossLinks(ctx) {
 }
 async function sourceTemporalShift(ctx) {
   requireProjectAnalytics(ctx.query);
-  const project = await requireProject(ctx, ctx.query.project_id);
-  const [areas, categories, projectKeywords] = await Promise.all([
-    all(ctx.db, 'subjectAreas'), all(ctx.db, 'subjectCategories'),
-    find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.query.project_id), { limit: Infinity }),
-  ]);
-  const area = projectAreaFor(project, areas);
-  const categoryIds = new Set(categories.filter(row => !isDeleted(row) && String(row.subject_area_id) === String(area?.subject_area_id || area?.id))
-    .map(row => String(row.subject_category_id || row.id)));
-  if (!categoryIds.size && !projectKeywords.length) return { heatmap: [], driftEntropy: 'LOW', description: 'No data available.' };
-
   const articles = await collaborationScopedArticles(ctx);
-  const latestYear = articles.reduce((max, row) => Math.max(max, yearOf(row) || 0), 0) || new Date().getFullYear();
-  const startYear = latestYear - 7; const endYear = latestYear;
-  const articleIds = new Set(articles.filter(row => yearOf(row) >= startYear && yearOf(row) <= endYear).map(row => String(row.article_id || row.id)));
-  const [keywords, keywordLinks, topics] = await Promise.all([all(ctx.db, 'keywords'), all(ctx.db, 'keyword_articles'), all(ctx.db, 'topics')]);
-  const keywordById = new Map(keywords.map(row => [String(row.keyword_id || row.id), row]));
-  const topicById = new Map(topics.map(row => [String(row.topic_id || row.id), row]));
-  const articleById = new Map(articles.map(row => [String(row.article_id || row.id), row]));
+  const datedArticles = articles.filter(article => yearOf(article));
+  if (!datedArticles.length) return { heatmap: [], driftEntropy: 'LOW', description: 'No keyword trend data available.' };
+  const latestYear = Math.max(...datedArticles.map(yearOf));
+  const startYear = latestYear - 7;
   const keywordCounts = new Map(); const volumes = new Map();
-  for (const link of keywordLinks) {
-    const articleId = String(link.article_id || ''); const keywordId = String(link.keyword_id || '');
-    if (!articleIds.has(articleId) || !keywordById.has(keywordId)) continue;
-    keywordCounts.set(keywordId, (keywordCounts.get(keywordId) || 0) + 1);
-    const article = articleById.get(articleId);
-    const year = yearOf(article); const key = `${keywordId}:${year}`;
-    volumes.set(key, (volumes.get(key) || 0) + 1);
-  }
-  const topKeywords = [...keywordCounts].sort((a, b) => b[1] - a[1]).slice(0, 7);
-  const maxVolume = Math.max(0, ...topKeywords.flatMap(([keywordId]) => Array.from({ length: 8 }, (_, index) => volumes.get(`${keywordId}:${startYear + index}`) || 0)));
-  const heatmap = [];
-  if (topKeywords.length) {
-    for (let row = 0; row < 7; row++) for (let col = 0; col < 8; col++) {
-      const count = topKeywords[row] ? volumes.get(`${topKeywords[row][0]}:${startYear + col}`) || 0 : 0;
-      const intensity = maxVolume ? 0.1 + count / maxVolume * 0.9 : 0.1;
-      heatmap.push({ id: row * 8 + col, intensity: Math.round(intensity * 100) / 100 });
+  for (const article of datedArticles) {
+    const year = yearOf(article);
+    if (year < startYear || year > latestYear) continue;
+    const labels = new Set([
+      ...(article.keywords || []),
+      ...(article.keyword_objects || []).map(item => item?.display_name || item?.name),
+    ].map(value => String(value || '').trim()).filter(Boolean));
+    for (const label of labels) {
+      const key = label.toLocaleLowerCase();
+      const item = keywordCounts.get(key) || { label, count: 0 };
+      item.count += 1;
+      keywordCounts.set(key, item);
+      const yearKey = `${key}:${year}`;
+      volumes.set(yearKey, (volumes.get(yearKey) || 0) + 1);
     }
-  } else {
-    for (let id = 0; id < 56; id++) heatmap.push({ id, intensity: Math.round((0.1 + Math.random() * 0.9) * 100) / 100 });
   }
-  const categoryCounts = new Map();
-  for (const article of articles) {
-    const topic = topicById.get(String(article.primary_topic || '')); const categoryId = String(topic?.subject_category_id || '');
-    if (!categoryId) continue;
-    const category = categories.find(row => String(row.subject_category_id || row.id) === categoryId);
-    if (category) categoryCounts.set(categoryId, { name: category.display_name || category.name, count: (categoryCounts.get(categoryId)?.count || 0) + 1 });
+  const topKeywords = [...keywordCounts.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 7);
+  if (!topKeywords.length) return { heatmap: [], driftEntropy: 'LOW', description: 'No keyword trend data available for the selected articles.' };
+  const maxVolume = Math.max(1, ...topKeywords.flatMap(([key]) => Array.from({ length: 8 }, (_, index) => volumes.get(`${key}:${startYear + index}`) || 0)));
+  const heatmap = [];
+  for (let row = 0; row < topKeywords.length; row++) for (let col = 0; col < 8; col++) {
+    const count = volumes.get(`${topKeywords[row][0]}:${startYear + col}`) || 0;
+    heatmap.push({ id: row * 8 + col, intensity: Math.round((count / maxVolume) * 100) / 100 });
   }
-  const topCategories = [...categoryCounts.values()].sort((a, b) => b.count - a.count).slice(0, 2);
-  const cat1 = topCategories[0]?.name || 'Green Hydrogen'; const cat2 = topCategories[1]?.name || 'Carbon Capture';
-  let driftEntropy = 'LOW';
-  if (topCategories.length > 1) {
-    const ratio = topCategories[0].count / (topCategories[1].count || 1);
-    driftEntropy = ratio > 2 ? 'LOW' : ratio > 1.2 ? 'MEDIUM' : 'HIGH';
-  }
-  return { heatmap, driftEntropy, description: `Clusters are stabilizing around ${cat1} and ${cat2} techs.` };
+  const total = topKeywords.reduce((sum, [, item]) => sum + item.count, 0);
+  const entropy = total ? -topKeywords.reduce((sum, [, item]) => {
+    const probability = item.count / total;
+    return probability ? sum + probability * Math.log(probability) : sum;
+  }, 0) / Math.log(Math.max(2, topKeywords.length)) : 0;
+  const driftEntropy = entropy < 0.45 ? 'LOW' : entropy < 0.75 ? 'MEDIUM' : 'HIGH';
+  const labels = topKeywords.slice(0, 2).map(([, item]) => item.label);
+  const description = labels.length > 1
+    ? `Recent work is concentrated around ${labels[0]} and ${labels[1]}.`
+    : `Recent work is concentrated around ${labels[0]}.`;
+  return { heatmap, driftEntropy, description, years: Array.from({ length: 8 }, (_, index) => startYear + index), keywords: topKeywords.map(([, item]) => item.label) };
 }
 async function sourceCuratedArticles(ctx) {
   requireProjectAnalytics(ctx.query);
   await requireProject(ctx, ctx.query.project_id);
   const page = number(ctx.query.page, 1); const limit = number(ctx.query.limit, 10);
   if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new HttpError(400, 'Invalid pagination parameters', 'VALIDATION_ERROR');
-  const [articles, scopeLinks, projectKeywords, categories, areas, topics, subTopics, keywordLinks, keywords, authorLinks, authors, issues, volumes, journals] = await Promise.all([
-    all(ctx.db, 'articles'), find(ctx.db, 'project_article_scopes', row => String(row.project_id) === String(ctx.query.project_id), { limit: Infinity }),
-    find(ctx.db, 'project_keywords', row => String(row.project_id) === String(ctx.query.project_id), { limit: Infinity }),
-    all(ctx.db, 'subjectCategories'), all(ctx.db, 'subjectAreas'), all(ctx.db, 'topics'), all(ctx.db, 'sub_topics'),
-    all(ctx.db, 'keyword_articles'), all(ctx.db, 'keywords'), all(ctx.db, 'author_articles'), all(ctx.db, 'authors'),
-    all(ctx.db, 'issues'), all(ctx.db, 'volumes'), all(ctx.db, 'journals'),
-  ]);
-  const scopeIds = new Set(scopeLinks.map(row => String(row.article_id || '')));
-  const project = await byId(ctx.db, 'projects', ctx.query.project_id);
-  const area = projectAreaFor(project, areas);
-  const scopeCategoryIds = new Set(categories.filter(row => !isDeleted(row) && String(row.subject_area_id) === String(area?.subject_area_id || area?.id))
-    .map(row => String(row.subject_category_id || row.id)));
-  const scopeTopicIds = new Set(topics.filter(row => scopeCategoryIds.has(String(row.subject_category_id))).map(row => String(row.topic_id || row.id)));
-  const scopeKeywordIds = new Set(projectKeywords.map(row => String(row.keyword_id || '')).filter(Boolean));
-  const topicLinksByArticle = new Map(); const keywordIdsByArticle = new Map();
-  const add = (map, key, value) => { if (!map.has(key)) map.set(key, new Set()); map.get(key).add(value); };
-  for (const link of subTopics) add(topicLinksByArticle, String(link.article_id), String(link.topic_id));
-  for (const link of keywordLinks) add(keywordIdsByArticle, String(link.article_id), String(link.keyword_id));
-  const topicById = new Map(topics.map(row => [String(row.topic_id || row.id), row]));
-  const requestedArea = String(ctx.query.subject_area || '').trim().toLowerCase();
-  const requestedKeywords = String(ctx.query.keywords || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
-  const keywordById = new Map(keywords.map(row => [String(row.keyword_id || row.id), row]));
   const requestedYearFrom = ctx.query.from_year ? number(ctx.query.from_year, NaN) : undefined;
   const requestedYearTo = ctx.query.to_year ? number(ctx.query.to_year, NaN) : undefined;
   for (const [key, value] of [['from_year', requestedYearFrom], ['to_year', requestedYearTo]]) {
     if (value !== undefined && !Number.isInteger(value)) throw new HttpError(400, `${key} must be an integer`, 'VALIDATION_ERROR');
   }
   if (requestedYearFrom !== undefined && requestedYearTo !== undefined && requestedYearFrom > requestedYearTo) throw new HttpError(400, 'Invalid year range: from_year cannot be greater than to_year', 'VALIDATION_ERROR');
-  const issueById = new Map(issues.map(row => [String(row.issue_id || row.id), row]));
-  const volumeById = new Map(volumes.map(row => [String(row.volume_id || row.id), row]));
-  const journalById = new Map(journals.map(row => [String(row.journal_id || row.id), row]));
-  let rows = articles.filter(article => {
-    if (isDeleted(article)) return false;
-    const id = String(article.article_id || article.id);
-    if (scopeLinks.length) { if (!scopeIds.has(id)) return false; }
-    else {
-      const topicMatches = scopeTopicIds.has(String(article.primary_topic || '')) || [...(topicLinksByArticle.get(id) || [])].some(topicId => scopeTopicIds.has(topicId));
-      const keywordMatches = [...(keywordIdsByArticle.get(id) || [])].some(keywordId => scopeKeywordIds.has(keywordId));
-      if (!topicMatches && !keywordMatches) return false;
-    }
-    if (requestedArea) {
-      const topicIds = new Set([String(article.primary_topic || ''), ...(topicLinksByArticle.get(id) || [])]);
-      const matches = [...topicIds].some(topicId => {
-        const categoryId = topicById.get(topicId)?.subject_category_id;
-        const category = categories.find(row => String(row.subject_category_id || row.id) === String(categoryId));
-        const subjectArea = areas.find(row => String(row.subject_area_id || row.id) === String(category?.subject_area_id));
-        return String(subjectArea?.display_name || '').toLowerCase() === requestedArea;
-      });
-      if (!matches) return false;
-    }
-    if (requestedKeywords.length && ![...(keywordIdsByArticle.get(id) || [])].some(keywordId => requestedKeywords.includes(String(keywordById.get(keywordId)?.display_name || '').toLowerCase()))) return false;
+  const requestedKeywords = String(ctx.query.keywords || '').split(',').map(value => value.trim().toLocaleLowerCase()).filter(Boolean);
+  const works = await collaborationScopedArticles(ctx);
+  const rows = works.filter(article => {
     const year = yearOf(article);
-    if (requestedYearFrom && (year == null || year < requestedYearFrom)) return false;
-    if (requestedYearTo && (year == null || year > requestedYearTo)) return false;
-    if (ctx.query.is_open_access === 'true' || ctx.query.is_open_access === true) {
-      const issue = issueById.get(String(article.issue_id)); const volume = volumeById.get(String(issue?.volume_id)); const journal = journalById.get(String(volume?.journal_id));
-      if (journal?.is_open_access !== true) return false;
+    if (requestedYearFrom !== undefined && (year == null || year < requestedYearFrom)) return false;
+    if (requestedYearTo !== undefined && (year == null || year > requestedYearTo)) return false;
+    if (requestedKeywords.length) {
+      const labels = [...(article.keywords || []), ...(article.keyword_objects || []).map(item => item?.display_name || item?.name)]
+        .map(value => String(value || '').trim().toLocaleLowerCase());
+      if (!requestedKeywords.some(keyword => labels.some(label => label.includes(keyword)))) return false;
     }
     return true;
-  });
-  const articleAuthors = new Map();
-  for (const link of authorLinks) add(articleAuthors, String(link.article_id), String(link.author_id));
-  const authorById = new Map(authors.map(row => [String(row.author_id || row.id), row]));
-  rows.sort((a, b) => {
-    const yearA = yearOf(a); const yearB = yearOf(b);
-    if (yearA !== yearB) return yearB == null ? 1 : yearA == null ? -1 : yearB - yearA;
-    return String(b.created_at || '').localeCompare(String(a.created_at || ''));
-  });
+  }).sort((a, b) => (yearOf(b) || 0) - (yearOf(a) || 0) || String(a.title || '').localeCompare(String(b.title || '')));
   const total = rows.length; const totalPages = Math.ceil(total / limit);
   const items = rows.slice((page - 1) * limit, page * limit).map(article => {
-    const id = String(article.article_id || article.id); const issue = issueById.get(String(article.issue_id)); const volume = volumeById.get(String(issue?.volume_id)); const journal = journalById.get(String(volume?.journal_id));
-    const authorNames = [...(articleAuthors.get(id) || [])].map(authorId => authorById.get(authorId)?.display_name).filter(Boolean);
-    const keywordNames = [...(keywordIdsByArticle.get(id) || [])].map(keywordId => keywordById.get(keywordId)?.display_name).filter(Boolean);
-    return { id: article.article_id || article.id, title: article.title, description: article.abstract, publishedYear: article.publication_year, isOpenAccess: journal?.is_open_access === true, authors: authorNames.join(', ') || 'Unknown Authors', keywords: keywordNames.join(', '), isBookmarked: false };
+    const authorNames = (article.authors || []).map(author => author.display_name).filter(Boolean);
+    const keywordNames = [...new Set([...(article.keywords || []), ...(article.keyword_objects || []).map(item => item?.display_name || item?.name)].filter(Boolean))];
+    return {
+      id: article.article_id || article.id,
+      title: article.title || 'Untitled article',
+      description: article.abstract || '',
+      publishedYear: yearOf(article),
+      isOpenAccess: article.is_open_access === true,
+      authors: authorNames.join(', ') || 'Unknown Authors',
+      keywords: keywordNames.join(', '),
+      isBookmarked: false,
+    };
   });
   return { total, totalPages, currentPage: page, items };
 }
@@ -2599,11 +2564,45 @@ async function sourceKeywordVectors(ctx) {
   const limit = ctx.query.limit === undefined ? 10 : number(ctx.query.limit, NaN);
   if (!Number.isFinite(windowMonths) || windowMonths <= 0 || windowMonths > 36) throw new HttpError(400, 'Invalid window_months', 'VALIDATION_ERROR');
   if (!Number.isFinite(limit) || limit <= 0) throw new HttpError(400, 'Invalid limit', 'VALIDATION_ERROR');
-  const boundedLimit = Math.min(50, limit);
+
+  // OpenAlex supplies keyword labels on each work. Aggregate those directly;
+  // local keyword_articles links are not populated for this live-source path.
   const query = { ...ctx.query, keywords: ctx.query.keywords || ctx.query.keyword };
   const articles = await collaborationScopedArticles({ ...ctx, query });
-  const vectors = await keywordVectors({ ...ctx, query: { ...query, limit: boundedLimit, window_months: windowMonths } }, articles);
-  return vectors.slice(0, boundedLimit);
+  if (!articles.length) return [];
+  const boundedLimit = Math.min(50, limit);
+  const latestYear = Math.max(...articles.map(yearOf).filter(Number.isFinite), 0);
+  if (!latestYear) return [];
+  const windowYears = Math.min(3, Math.max(1, Math.ceil(windowMonths / 12)));
+  const currentYears = new Set(Array.from({ length: windowYears }, (_, index) => latestYear - index));
+  const previousYears = new Set(Array.from({ length: windowYears }, (_, index) => latestYear - windowYears - index));
+  const counts = new Map();
+
+  for (const article of articles) {
+    const articleId = String(article.article_id || article.id || '');
+    const year = yearOf(article);
+    if (!articleId || !year) continue;
+    const labels = new Set([
+      ...(article.keywords || []),
+      ...(article.keyword_objects || []).map(item => item?.display_name || item?.name),
+    ].map(value => String(value || '').trim()).filter(Boolean));
+    for (const label of labels) {
+      const key = label.toLocaleLowerCase();
+      const item = counts.get(key) || { keyword: label, current: new Set(), previous: new Set() };
+      if (currentYears.has(year)) item.current.add(articleId);
+      if (previousYears.has(year)) item.previous.add(articleId);
+      counts.set(key, item);
+    }
+  }
+
+  return [...counts.values()].map(item => {
+    const volume = item.current.size;
+    const previous = item.previous.size;
+    const growth = previous === 0 ? (volume > 0 ? 100 : 0) : (volume - previous) / previous * 100;
+    return { keyword: item.keyword, volume, growth: Math.round(growth * 10) / 10 };
+  }).filter(item => item.keyword && item.volume > 0 && Number.isFinite(item.growth))
+    .sort((a, b) => b.growth - a.growth || b.volume - a.volume)
+    .slice(0, boundedLimit);
 }
 function addTopicId(map, articleId, topicId) { if (!map.has(articleId)) map.set(articleId, new Set()); map.get(articleId).add(topicId); }
 async function authorProductivityMatrix(ctx, articles) {
