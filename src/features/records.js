@@ -1651,7 +1651,7 @@ async function authorArticles(ctx) {
   return { success: true, code: 'AUTHOR_ARTICLES_FETCHED', message: 'LÃ¡ÂºÂ¥y bÃƒÂ i viÃ¡ÂºÂ¿t cÃ¡Â»Â§a tÃƒÂ¡c giÃ¡ÂºÂ£ thÃƒÂ nh cÃƒÂ´ng', pagination: { page, limit, total: rows.length, total_pages: Math.max(1, Math.ceil(rows.length / limit)) }, data: rows.slice(start, start + limit) };
 }
 
-const ORGANIZATION_LIKE_AUTHOR_NAME = /\b(universit(?:y|ies)|college|institute|institution|museum|laborator(?:y|ies)|lab|research center|research centre|biodiversity center|biodiversity centre|botanic garden|botanical garden|academy|hospital|society|foundation|observatory|department|ministry|organization|organisation|association|library|herbarium|bureau|commission|corporation|consortium|council|agency)\b/i;
+const ORGANIZATION_LIKE_AUTHOR_NAME = /\b(universit(?:y|ies)|college|institute|institution|museum|laborator(?:y|ies)|lab|research center|research centre|biodiversity center|biodiversity centre|botanic garden|botanical garden|academy|hospital|society|foundation|observatory|department|ministry|organization|organisation|association|library|herbarium|bureau|commission|corporation|consortium|council|agency|cluster)\b/i;
 
 function isOrganizationLikeAuthor(name, orcid) {
   return !orcid && ORGANIZATION_LIKE_AUTHOR_NAME.test(String(name || '').trim());
